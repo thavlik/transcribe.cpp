@@ -247,4 +247,30 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &                   
                                           int                                           mel_n_frames,
                                           transcribe::SessionCore *                     abort_session);
 
+// One chunk of that forward, for callers that own the chunking (the
+// multitalker streaming API feeds chunks as audio arrives): Graph A
+// (pre_encode) over `mel_window` (row-major [mel_n_mels, M]), `drop`
+// leading pre-encode frames discarded, Graph B over the
+// [spkcache | fifo | chunk] concat, then the host AOSC/FIFO update, which
+// appends the chunk's preds to sc.stream.total_preds (nothing for a
+// degenerate tail chunk with no frames left after `drop`). lc / rc are the
+// chunk's left / right context in diar frames (0 for external cadence).
+// sc.stream must have been reset once before the first chunk; `sched` is
+// reset per graph. run_diar_streaming_core is a loop over this function.
+transcribe_status run_diar_stream_chunk(DiarStreamScratch &                           sc,
+                                        const SortformerHParams &                     hp,
+                                        const transcribe::parakeet::ParakeetHParams & chp,
+                                        const transcribe::parakeet::ParakeetWeights & conformer,
+                                        const SortformerWeights &                     w,
+                                        const char *                                  backend,
+                                        ggml_backend_sched_t                          sched,
+                                        int                                           n_threads,
+                                        const SortformerStreamParams &                P,
+                                        const float *                                 mel_window,
+                                        int                                           mel_n_mels,
+                                        int                                           M,
+                                        int                                           drop,
+                                        int                                           lc,
+                                        int                                           rc);
+
 }  // namespace transcribe::sortformer

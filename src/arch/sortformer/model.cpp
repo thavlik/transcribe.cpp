@@ -483,7 +483,9 @@ StreamInferBuild build_stream_infer_graph(ggml_context *              ctx,
     bp.n_head          = chp.enc_n_heads;
     bp.conv_kernel     = chp.enc_conv_kernel;
     bp.kv_type         = GGML_TYPE_F32;
-    bool enc_use_flash = true, dec_use_flash = false;
+    // Full attention over the concat: flash only where the backend's flash
+    // kernel takes the per-head relative-position mask.
+    bool enc_use_flash = conf::detect_rel_pos_flash(backend), dec_use_flash = false;
     transcribe::flash::apply_env_overrides(enc_use_flash, dec_use_flash);
     bp.use_flash          = enc_use_flash;
     bp.policy             = sf_conv_policy(backend);
@@ -748,7 +750,6 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
                                           int                            mel_n_frames,
                                           transcribe::SessionCore *      abort_session) {
     const int ed       = chp.enc_d_model;
-    const int n_spk    = hp.max_speakers;
     const int sub      = hp.enc_subsampling_factor;
     const int feat_len = mel_n_frames;
 
@@ -795,31 +796,6 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
         }
         const int M = win_hi - win_lo;
 
-        if (sc.compute_ctx != nullptr) {
-            ggml_free(sc.compute_ctx);
-            sc.compute_ctx = nullptr;
-        }
-        {
-            ggml_init_params ip{};
-            ip.mem_size    = 32 * 1024 * 1024;
-            ip.mem_buffer  = nullptr;
-            ip.no_alloc    = true;
-            sc.compute_ctx = ggml_init(ip);
-            if (sc.compute_ctx == nullptr) {
-                return TRANSCRIBE_ERR_OOM;
-            }
-        }
-        ggml_context * ctx = sc.compute_ctx;
-        transcribe::debug::push_name_prefix("stream.chunk");
-
-        // ---- Graph A: pre_encode over the mel window ----
-        PreEncodeBuild A = build_pre_encode_graph(ctx, chp, conformer.pre_encode, backend, M);
-        if (A.graph == nullptr) {
-            transcribe::debug::pop_name_prefix();
-            return TRANSCRIBE_ERR_GGUF;
-        }
-        int T_diar = static_cast<int>(A.out->ne[1]);
-
         // Mel window [n_mels, M] from full mel [n_mels, feat_len], cols
         // [win_lo, win_hi). ggml ne=[M, n_mels] -> offset mel*M + col.
         sc.chunk_mel_buf.resize(static_cast<size_t>(mel_n_mels) * M);
@@ -828,83 +804,137 @@ transcribe_status run_diar_streaming_core(DiarStreamScratch &            sc,
             std::copy(src, src + M, sc.chunk_mel_buf.data() + static_cast<size_t>(mel) * M);
         }
 
-        ggml_backend_sched_reset(sched);
-        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, A.graph, "sortformer")) {
-            transcribe::debug::pop_name_prefix();
-            return TRANSCRIBE_ERR_OOM;
+        if (const transcribe_status st = run_diar_stream_chunk(sc, hp, chp, conformer, w, backend, sched, n_threads, P,
+                                                               sc.chunk_mel_buf.data(), mel_n_mels, M, drop, lc, rc);
+            st != TRANSCRIBE_OK) {
+            return st;
         }
-        ggml_backend_tensor_set(A.mel_in, sc.chunk_mel_buf.data(), 0, sc.chunk_mel_buf.size() * sizeof(float));
-        transcribe::configure_sched_n_threads(sched, n_threads);
-        if (ggml_backend_sched_graph_compute(sched, A.graph) != GGML_STATUS_SUCCESS) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sortformer streaming: pre_encode compute failed");
-            transcribe::debug::pop_name_prefix();
-            return TRANSCRIBE_ERR_BACKEND;
-        }
-        sc.chunk_embs_host.resize(static_cast<size_t>(T_diar) * ed);
-        ggml_backend_tensor_get(A.out, sc.chunk_embs_host.data(), 0, sc.chunk_embs_host.size() * sizeof(float));
-
-        // External cadence: discard the duplicated / partially-contexted
-        // pre-encode outputs (NeMo drop_extra_pre_encoded, applied right
-        // after pre_encode and before the encoder).
-        if (drop > 0) {
-            if (T_diar <= drop) {
-                // Degenerate tail chunk: nothing valid to append.
-                transcribe::debug::pop_name_prefix();
-                stt = end;
-                ++chunk_idx;
-                continue;
-            }
-            sc.chunk_embs_host.erase(sc.chunk_embs_host.begin(),
-                                     sc.chunk_embs_host.begin() + static_cast<size_t>(drop) * ed);
-            T_diar -= drop;
-        }
-
-        // ---- host concat [spkcache | fifo | chunk_embs] ----
-        const int S        = sc.stream.spkcache_n;
-        const int F        = sc.stream.fifo_n;
-        const int T_concat = S + F + T_diar;
-        sc.concat_host.resize(static_cast<size_t>(T_concat) * ed);
-        std::copy(sc.stream.spkcache.begin(), sc.stream.spkcache.begin() + static_cast<size_t>(S) * ed,
-                  sc.concat_host.begin());
-        std::copy(sc.stream.fifo.begin(), sc.stream.fifo.begin() + static_cast<size_t>(F) * ed,
-                  sc.concat_host.begin() + static_cast<size_t>(S) * ed);
-        std::copy(sc.chunk_embs_host.begin(), sc.chunk_embs_host.end(),
-                  sc.concat_host.begin() + static_cast<size_t>(S + F) * ed);
-
-        // ---- Graph B: xscale + 17 blocks + proj + 18 tf + head ----
-        StreamInferBuild B = build_stream_infer_graph(ctx, hp, chp, conformer, w, backend, T_concat);
-        if (B.graph == nullptr) {
-            transcribe::debug::pop_name_prefix();
-            return TRANSCRIBE_ERR_GGUF;
-        }
-        fill_rel_pos_emb(sc.pos_buf, sc.pos_div_term, 2 * T_concat - 1, ed);
-
-        ggml_backend_sched_reset(sched);
-        if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, B.graph, "sortformer")) {
-            transcribe::debug::pop_name_prefix();
-            return TRANSCRIBE_ERR_OOM;
-        }
-        ggml_backend_tensor_set(B.concat_in, sc.concat_host.data(), 0, sc.concat_host.size() * sizeof(float));
-        ggml_backend_tensor_set(B.pos_emb_in, sc.pos_buf.data(), 0, sc.pos_buf.size() * sizeof(float));
-        transcribe::configure_sched_n_threads(sched, n_threads);
-        if (ggml_backend_sched_graph_compute(sched, B.graph) != GGML_STATUS_SUCCESS) {
-            log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sortformer streaming: infer compute failed");
-            transcribe::debug::pop_name_prefix();
-            return TRANSCRIBE_ERR_BACKEND;
-        }
-        sc.stream_preds_host.resize(static_cast<size_t>(T_concat) * n_spk);
-        ggml_backend_tensor_get(B.preds, sc.stream_preds_host.data(), 0, sc.stream_preds_host.size() * sizeof(float));
-
-        transcribe::debug::pop_name_prefix();
-
-        // ---- host streaming update (FIFO + AOSC compress) ----
-        streaming_update_sync(sc.stream, P, n_spk, ed, sc.chunk_embs_host, T_diar, sc.stream_preds_host, T_concat, lc,
-                              rc);
 
         stt = end;
         ++chunk_idx;
     }
     (void) chunk_idx;
+    return TRANSCRIBE_OK;
+}
+
+// One chunk of the streaming forward (see the declaration in sortformer.h).
+// The window buffer must not alias sc's own scratch other than
+// chunk_mel_buf, which this function only reads.
+transcribe_status run_diar_stream_chunk(DiarStreamScratch &            sc,
+                                        const SortformerHParams &      hp,
+                                        const pk::ParakeetHParams &    chp,
+                                        const pk::ParakeetWeights &    conformer,
+                                        const SortformerWeights &      w,
+                                        const char *                   backend,
+                                        ggml_backend_sched_t           sched,
+                                        int                            n_threads,
+                                        const SortformerStreamParams & P,
+                                        const float *                  mel_window,
+                                        int                            mel_n_mels,
+                                        int                            M,
+                                        int                            drop,
+                                        int                            lc,
+                                        int                            rc) {
+    const int ed    = chp.enc_d_model;
+    const int n_spk = hp.max_speakers;
+    if (sched == nullptr || mel_window == nullptr || M <= 0) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+
+    if (sc.compute_ctx != nullptr) {
+        ggml_free(sc.compute_ctx);
+        sc.compute_ctx = nullptr;
+    }
+    {
+        ggml_init_params ip{};
+        ip.mem_size    = 32 * 1024 * 1024;
+        ip.mem_buffer  = nullptr;
+        ip.no_alloc    = true;
+        sc.compute_ctx = ggml_init(ip);
+        if (sc.compute_ctx == nullptr) {
+            return TRANSCRIBE_ERR_OOM;
+        }
+    }
+    ggml_context * ctx = sc.compute_ctx;
+    transcribe::debug::push_name_prefix("stream.chunk");
+
+    // ---- Graph A: pre_encode over the mel window ----
+    PreEncodeBuild A = build_pre_encode_graph(ctx, chp, conformer.pre_encode, backend, M);
+    if (A.graph == nullptr) {
+        transcribe::debug::pop_name_prefix();
+        return TRANSCRIBE_ERR_GGUF;
+    }
+    int T_diar = static_cast<int>(A.out->ne[1]);
+
+    ggml_backend_sched_reset(sched);
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, A.graph, "sortformer")) {
+        transcribe::debug::pop_name_prefix();
+        return TRANSCRIBE_ERR_OOM;
+    }
+    ggml_backend_tensor_set(A.mel_in, mel_window, 0, static_cast<size_t>(mel_n_mels) * M * sizeof(float));
+    transcribe::configure_sched_n_threads(sched, n_threads);
+    if (ggml_backend_sched_graph_compute(sched, A.graph) != GGML_STATUS_SUCCESS) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sortformer streaming: pre_encode compute failed");
+        transcribe::debug::pop_name_prefix();
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    sc.chunk_embs_host.resize(static_cast<size_t>(T_diar) * ed);
+    ggml_backend_tensor_get(A.out, sc.chunk_embs_host.data(), 0, sc.chunk_embs_host.size() * sizeof(float));
+
+    // External cadence: discard the duplicated / partially-contexted
+    // pre-encode outputs (NeMo drop_extra_pre_encoded, applied right
+    // after pre_encode and before the encoder).
+    if (drop > 0) {
+        if (T_diar <= drop) {
+            // Degenerate tail chunk: nothing valid to append.
+            transcribe::debug::pop_name_prefix();
+            return TRANSCRIBE_OK;
+        }
+        sc.chunk_embs_host.erase(sc.chunk_embs_host.begin(),
+                                 sc.chunk_embs_host.begin() + static_cast<size_t>(drop) * ed);
+        T_diar -= drop;
+    }
+
+    // ---- host concat [spkcache | fifo | chunk_embs] ----
+    const int S        = sc.stream.spkcache_n;
+    const int F        = sc.stream.fifo_n;
+    const int T_concat = S + F + T_diar;
+    sc.concat_host.resize(static_cast<size_t>(T_concat) * ed);
+    std::copy(sc.stream.spkcache.begin(), sc.stream.spkcache.begin() + static_cast<size_t>(S) * ed,
+              sc.concat_host.begin());
+    std::copy(sc.stream.fifo.begin(), sc.stream.fifo.begin() + static_cast<size_t>(F) * ed,
+              sc.concat_host.begin() + static_cast<size_t>(S) * ed);
+    std::copy(sc.chunk_embs_host.begin(), sc.chunk_embs_host.end(),
+              sc.concat_host.begin() + static_cast<size_t>(S + F) * ed);
+
+    // ---- Graph B: xscale + 17 blocks + proj + 18 tf + head ----
+    StreamInferBuild B = build_stream_infer_graph(ctx, hp, chp, conformer, w, backend, T_concat);
+    if (B.graph == nullptr) {
+        transcribe::debug::pop_name_prefix();
+        return TRANSCRIBE_ERR_GGUF;
+    }
+    fill_rel_pos_emb(sc.pos_buf, sc.pos_div_term, 2 * T_concat - 1, ed);
+
+    ggml_backend_sched_reset(sched);
+    if (!TRANSCRIBE_ALLOC_SCHED_GRAPH(sched, B.graph, "sortformer")) {
+        transcribe::debug::pop_name_prefix();
+        return TRANSCRIBE_ERR_OOM;
+    }
+    ggml_backend_tensor_set(B.concat_in, sc.concat_host.data(), 0, sc.concat_host.size() * sizeof(float));
+    ggml_backend_tensor_set(B.pos_emb_in, sc.pos_buf.data(), 0, sc.pos_buf.size() * sizeof(float));
+    transcribe::configure_sched_n_threads(sched, n_threads);
+    if (ggml_backend_sched_graph_compute(sched, B.graph) != GGML_STATUS_SUCCESS) {
+        log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "sortformer streaming: infer compute failed");
+        transcribe::debug::pop_name_prefix();
+        return TRANSCRIBE_ERR_BACKEND;
+    }
+    sc.stream_preds_host.resize(static_cast<size_t>(T_concat) * n_spk);
+    ggml_backend_tensor_get(B.preds, sc.stream_preds_host.data(), 0, sc.stream_preds_host.size() * sizeof(float));
+
+    transcribe::debug::pop_name_prefix();
+
+    // ---- host streaming update (FIFO + AOSC compress) ----
+    streaming_update_sync(sc.stream, P, n_spk, ed, sc.chunk_embs_host, T_diar, sc.stream_preds_host, T_concat, lc, rc);
     return TRANSCRIBE_OK;
 }
 

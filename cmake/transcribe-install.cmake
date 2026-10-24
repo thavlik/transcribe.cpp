@@ -208,6 +208,38 @@ if(NOT TRANSCRIBE_BUILD_SHARED)
         endif()
         list(REMOVE_DUPLICATES _library_paths)
     endif()
+    if("cuda" IN_LIST _kinds)
+        # ggml-cuda is an archive in this posture, but the CUDA runtime,
+        # cuBLAS and the driver API are toolkit libraries that CMake only
+        # propagates (as FindCUDAToolkit imported targets) to in-tree links.
+        # Record the absolute paths FindCUDAToolkit resolved; its
+        # find_library results are cache variables, so they are visible here
+        # even though the imported targets are scoped to ggml-cuda. The list
+        # mirrors ggml-cuda's own target_link_libraries.
+        if(GGML_STATIC AND NOT WIN32)
+            set(_cuda_libs cudart_static cublas_static cublasLt_static culibos)
+        else()
+            set(_cuda_libs cudart cublas cublasLt)
+        endif()
+        if(NOT GGML_CUDA_NO_VMM)
+            list(APPEND _cuda_libs cuda_driver)
+        endif()
+        foreach(_cuda_lib IN LISTS _cuda_libs)
+            if(NOT CUDA_${_cuda_lib}_LIBRARY)
+                message(FATAL_ERROR
+                    "transcribe install: could not resolve CUDA library "
+                    "${_cuda_lib} for the static link manifest")
+            endif()
+            list(APPEND _library_paths "${CUDA_${_cuda_lib}_LIBRARY}")
+        endforeach()
+        if(GGML_CUDA_NCCL AND NCCL_LIBRARY)
+            list(APPEND _library_paths "${NCCL_LIBRARY}")
+        endif()
+        if(GGML_STATIC AND UNIX)
+            list(APPEND _system_libs rt)
+        endif()
+        list(REMOVE_DUPLICATES _library_paths)
+    endif()
     if(_frameworks)
         list(REMOVE_DUPLICATES _frameworks)
     endif()

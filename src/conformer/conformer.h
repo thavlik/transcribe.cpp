@@ -146,6 +146,16 @@ bool resolve_conv_direct(const char * direct_env, const char * no_direct_env, bo
 // f32 weights. Metal and CPU prefer direct.
 bool detect_direct_pw(const char * backend);
 
+// Default BlockParams::use_flash for full / local relative-position
+// attention on `backend`. The relative-position bias reaches
+// ggml_flash_attn_ext as a per-head mask (ne[2] == n_head), which the CUDA
+// and ROCm flash kernels reject (they take a mask broadcast over heads), so
+// there the scheduler would run every block's attention on the CPU and pay
+// a device round trip per block. The manual mul_mat + soft_max path stays
+// on the device. TRANSCRIBE_NO_FLASH / TRANSCRIBE_FORCE_FLASH still apply on
+// top (transcribe::flash::apply_env_overrides).
+bool detect_rel_pos_flash(const char * backend);
+
 // Scalar knobs for the block forward. All fields required except the
 // optional local-attention window (att_context_left / att_context_right).
 struct BlockParams {

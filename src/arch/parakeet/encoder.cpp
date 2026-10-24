@@ -593,10 +593,12 @@ EncoderBuild build_encoder_graph(ggml_context *                     ctx,
         bparams.n_head      = hp.enc_n_heads;
         bparams.conv_kernel = hp.enc_conv_kernel;
         bparams.kv_type     = kv_type;
-        // Flash attention is the default. TRANSCRIBE_NO_FLASH selects the F32
-        // mul_mat + soft_max path used by CPU tensor validation; flash casts
-        // the relative-position mask to F16. Parakeet has no attention decoder.
-        bool enc_use_flash = true, dec_use_flash = false;
+        // Flash attention is the default where the backend's flash kernel
+        // takes the per-head relative-position mask (conf::detect_rel_pos_flash).
+        // TRANSCRIBE_NO_FLASH selects the F32 mul_mat + soft_max path used by
+        // CPU tensor validation; flash casts the relative-position mask to
+        // F16. Parakeet has no attention decoder.
+        bool enc_use_flash = conf::detect_rel_pos_flash(backend_name), dec_use_flash = false;
         transcribe::flash::apply_env_overrides(enc_use_flash, dec_use_flash);
         bparams.use_flash          = enc_use_flash;
         bparams.policy             = policy;

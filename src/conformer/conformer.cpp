@@ -337,6 +337,13 @@ bool detect_direct_pw(const char * backend) {
     return resolve_conv_direct("TRANSCRIBE_CONV_DIRECT_PW", "TRANSCRIBE_CONV_NO_DIRECT_PW", backend_default);
 }
 
+bool detect_rel_pos_flash(const char * backend) {
+    if (backend == nullptr) {
+        return true;
+    }
+    return std::strstr(backend, "CUDA") == nullptr && std::strstr(backend, "ROCm") == nullptr;
+}
+
 // Conv module (pointwise -> GLU -> depthwise -> BN/LN -> SiLU -> pointwise).
 // Operates on the post-LayerNorm activation (LN applied by the caller).
 // Pointwise convs (k=1) are direct mul_mats in [d_model, T] layout by
@@ -393,7 +400,11 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
             ggml_tensor * gate  = ggml_view_3d(ctx, x, half, T, B, x->nb[1], x->nb[2],
                                                /*offset=*/0);
             ggml_tensor * value = ggml_view_3d(ctx, x, half, T, B, x->nb[1], x->nb[2], half * ggml_element_size(x));
-            x                   = ggml_mul(ctx, gate, ggml_sigmoid(ctx, value));
+            // The value half is a strided view, and GPU unary kernels
+            // (CUDA) only take contiguous input: without the cont the
+            // scheduler runs this sigmoid on the CPU, a device round trip
+            // per block.
+            x                   = ggml_mul(ctx, gate, ggml_sigmoid(ctx, ggml_cont(ctx, value)));
         }
         // x ne = [d_model, T, B]
 
@@ -417,7 +428,7 @@ ggml_tensor * conv_module(ggml_context * ctx, ggml_tensor * x, const BlockView &
         const int64_t half  = x->ne[1] / 2;
         ggml_tensor * gate  = ggml_view_4d(ctx, x, x->ne[0], half, 1, 1, x->nb[1], x->nb[2], x->nb[3], 0);
         ggml_tensor * value = ggml_view_4d(ctx, x, x->ne[0], half, 1, 1, x->nb[1], x->nb[2], x->nb[3], x->nb[1] * half);
-        x                   = ggml_mul(ctx, gate, ggml_sigmoid(ctx, value));
+        x                   = ggml_mul(ctx, gate, ggml_sigmoid(ctx, ggml_cont(ctx, value)));
 
         x = ggml_cont(ctx, x);
     }

@@ -3394,6 +3394,7 @@ transcribe_status stream_begin(transcribe_session *             session,
     }
 
     pc->stream_audio_input_samples = 0;
+    pc->mt_stream.reset();
 
     // -------- Buffered streaming path (parakeet-unified-en-0.6b) --------
     //
@@ -3456,13 +3457,12 @@ transcribe_status stream_begin(transcribe_session *             session,
                              // or a back-to-back stream_begin carries tokens.
     pc->stream_run_params = *run_params;
 
-    // Multitalker is a transcribe_run concern for now: the incremental
-    // streaming API keeps the shipped single-speaker semantics even on a
-    // bundle model. Warn so a diarize=ON stream isn't silently downgraded.
+    // Multitalker bundle: diarize=ON streams the embedded diarizer plus one
+    // cache-aware instance per active speaker (multitalker.cpp) on the
+    // chunk grid of the resolved lookahead. The session's own single-speaker
+    // caches stay untouched.
     if (run_params->diarize == TRANSCRIBE_DIARIZE_MODE_ON && pm->diar != nullptr) {
-        log_msg(TRANSCRIBE_LOG_LEVEL_WARN,
-                "parakeet: diarize=ON is not yet supported on the streaming API; "
-                "the stream is decoded single-speaker (use transcribe_run for multitalker)");
+        return multitalker_stream_begin(pc, pm, run_params, chosen_left, chosen_right);
     }
 
     // Allocate streaming caches on first stream_begin (idempotent); zero
@@ -3522,6 +3522,9 @@ transcribe_status stream_feed(transcribe_session *       session,
     auto * pm = static_cast<ParakeetModel *>(pc->model);
     if (pc->poll_abort()) {
         return TRANSCRIBE_ERR_ABORTED;
+    }
+    if (pc->mt_stream != nullptr) {
+        return multitalker_stream_feed(pc, pm, pcm, n_samples, update);
     }
 
     pc->stream_pcm_buffer.insert(pc->stream_pcm_buffer.end(), pcm, pcm + n_samples);
@@ -3748,6 +3751,9 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
     if (!pm->mel.has_value()) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
+    if (pc->mt_stream != nullptr) {
+        return multitalker_stream_finalize(pc, pm, update);
+    }
 
     const int prev_n_tokens = static_cast<int>(pc->raw_tokens.size());
 
@@ -3876,6 +3882,7 @@ void stream_reset(transcribe_session * session) {
     auto * pc = static_cast<ParakeetSession *>(session);
     pc->stream_pcm_buffer.clear();  // keep the allocation
     pc->stream_audio_input_samples = 0;
+    pc->mt_stream.reset();          // per-speaker instances + diarizer state
 }
 
 // Kind+slot probe. No run-slot extensions (always false on _RUN). On

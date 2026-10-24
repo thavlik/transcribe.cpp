@@ -304,6 +304,15 @@ struct ParakeetStreamingGraph {
     }
 };
 
+// Streaming multitalker state (bundle model, diarize=ON stream): the
+// embedded diarizer's streaming state plus one cache-aware ASR instance per
+// speaker slot. Defined in multitalker.cpp; opaque everywhere else.
+struct MultitalkerStream;
+
+struct MultitalkerStreamDeleter {
+    void operator()(MultitalkerStream * s) const noexcept;
+};
+
 // Concrete context. The per-call compute context and the multi-backend
 // scheduler that dispatches encoder graph ops to the best available backend
 // are owned by the transcribe_session base (sched / compute_ctx).
@@ -378,6 +387,14 @@ struct ParakeetSession final : public transcribe_session {
     int32_t buf_chunk_step      = 0;
     bool    buf_active          = false;
 
+    // ---- Multitalker streaming state ----
+    //
+    // Non-null from a diarize=ON stream_begin on a bundle model until that
+    // stream finalizes or resets. While set, stream_feed / stream_finalize
+    // route to the multitalker driver and the result snapshot carries one
+    // speaker-tagged segment per active speaker.
+    std::unique_ptr<MultitalkerStream, MultitalkerStreamDeleter> mt_stream;
+
     ParakeetSession() = default;
     ~ParakeetSession() override;
     void on_scratch_released() noexcept override;
@@ -430,6 +447,7 @@ transcribe_status build_result_from_raw_tokens(ParakeetSession *             pc,
 // multitalker streaming pass, which drives one cache/decoder-state
 // instance per speaker by swapping it into pc around each call.
 transcribe_status init_streaming_caches(ParakeetSession * pc, ParakeetModel * pm);
+void              zero_streaming_caches(ParakeetSession * pc);
 void              reset_streaming_decoder_state(ParakeetSession * pc, const ParakeetModel * pm);
 transcribe_status emit_streaming_chunk(ParakeetSession * pc,
                                        ParakeetModel *   pm,
@@ -450,5 +468,27 @@ transcribe_status run_multitalker(ParakeetSession *             pc,
                                   const float *                 pcm,
                                   int                           n_samples,
                                   const transcribe_run_params * params);
+
+// Multitalker streaming (diarize=ON stream on a bundle model), defined in
+// multitalker.cpp. The same chunk-causal pipeline as run_multitalker, driven
+// as audio arrives: every complete chunk on the shared encoder-frame grid
+// runs one diarizer step and then the ASR step of each speaker the
+// diarizer's cache gating selects. Feeding a clip in any split and then
+// finalizing yields the result run_multitalker produces for the whole clip.
+// att_context_left / att_context_right are the stream's resolved lookahead
+// menu entry; the chunk grid (diarizer included) follows its right context.
+transcribe_status multitalker_stream_begin(ParakeetSession *             pc,
+                                           ParakeetModel *               pm,
+                                           const transcribe_run_params * run_params,
+                                           int                           att_context_left,
+                                           int                           att_context_right);
+transcribe_status multitalker_stream_feed(ParakeetSession *          pc,
+                                          ParakeetModel *            pm,
+                                          const float *              pcm,
+                                          int                        n_samples,
+                                          transcribe_stream_update * update);
+transcribe_status multitalker_stream_finalize(ParakeetSession *          pc,
+                                              ParakeetModel *            pm,
+                                              transcribe_stream_update * update);
 
 }  // namespace transcribe::parakeet

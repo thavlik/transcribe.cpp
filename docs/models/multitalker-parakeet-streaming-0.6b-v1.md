@@ -277,13 +277,37 @@ replay instead of the streaming pass (parity/dump tooling; attention
 buffers grow quadratically with clip length — do not use on meetings
 longer than ~15 minutes).
 
+Each speaker instance owns its retained chunk graph (with its scheduler)
+and starts from a zeroed cache: the graph binds the instance's cache
+tensors as leaves, so a graph shared between instances would attend over
+another speaker's caches.
+
+### Streaming
+
+The same pipeline runs incrementally through the streaming API. Begin a
+stream with `diarize = ON` on a bundle and feed audio in any split: every
+chunk that completes on the encoder grid runs one diarizer step, then the
+encoder/decoder step of each speaker the cache gating selects. The stream
+snapshot has the offline result's shape (one speaker-tagged segment per
+active speaker with its words and tokens, plus the diarizer's speaker
+turns, whose `p` is the mean speaker activity over the turn), rebuilt as
+speakers grow. Feeding a clip at the default lookahead and finalizing
+reproduces `transcribe_run` on the whole clip word for word.
+
+- **Lookahead.** `transcribe_parakeet_stream_ext::att_context_right` picks
+  the menu entry: 13, 6, 1 or 0, i.e. 1.12 s, 0.56 s, 0.16 s or 0.08 s
+  chunks. The diarizer runs on the same chunk grid.
+- **Text.** Rows are rewritten as speakers grow and the merged `full_text`
+  is in segment order, so nothing commits before finalize: `committed_text`
+  stays empty during the stream and `tentative_text` holds the merged text.
+  Read the structured snapshot (segments, words, tokens, speaker segments)
+  for speaker-attributed output.
+- **Memory.** Bounded per active speaker (its caches plus one retained
+  chunk graph), plus the diarizer's accumulated predictions.
+
 ## Known limitations
 
-- **Multitalker is offline-API only.** `--diarize` on a bundle runs the
-  streaming pipeline internally, but the public streaming API
-  (`stream_feed`) still exposes single-speaker transcription only; a
-  per-speaker streaming text ABI is future work. `run_batch` on a bundle
-  warns and runs single-speaker.
+- **Batch.** `run_batch` on a bundle warns and runs single-speaker.
 - **English only.** The model is English-only by training.
 - **No translation and no language detection.**
 
