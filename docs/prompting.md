@@ -20,9 +20,25 @@ Probe `transcribe_model_supports()` for the matching feature bit.
 | Canary 180m-flash / 1b-flash / 1b-v2 | | | | yes |
 | Fun-ASR-Nano | yes | | | |
 | MOSS-Transcribe-Diarize | yes | | | |
+| Parakeet (TDT and RNN-T heads) | yes | | | |
 
 Per-model formats and restrictions are in each model doc's **Prompting:**
 note under [`models/`](models/).
+
+Parakeet has no prompt slot: its vocabulary biases the greedy transducer
+decode instead (shallow fusion). While the text a decoder has emitted for
+the current word spells the start of a term, the pieces that continue the
+term to its fifth character and beyond get a bonus on their joint logit
+(`TRANSCRIBE_PARAKEET_BOOST_WEIGHT`, default 4.0 nats; at most 3.0 of it
+counts against blank, so pieces are not emitted ahead of their audio). A
+word's first characters are left to the model: word-initial pieces are
+short, and a short prefix begins many terms and many ordinary words. A
+term's plural continues it as well as the singular does. Terms match case-insensitively under any tokenization,
+and only from a word boundary. Only an in-word continuation can turn a
+blank step into an emission, so a term is not inserted into silence;
+confidences stay on the raw logits. There is no token budget, but keep the
+list to the terms you expect (hundreds to a few thousand): every boosted
+prefix steers words that start like it.
 
 ## Limits
 

@@ -13,6 +13,7 @@
 
 #include "decoder.h"
 
+#include "boost.h"
 #include "parakeet.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
@@ -39,10 +40,12 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -772,12 +775,46 @@ transcribe_status build_host_decoder_weights(const ParakeetModel & model, HostDe
     out.n_vocab                  = hp.pred_vocab - 1;  // raw SP vocab size
     out.blank_id                 = hp.pred_vocab - 1;  // blank lives at vocab_size
 
+    out.pieces.assign(static_cast<size_t>(out.n_vocab), std::string());
+    out.piece_scores.assign(static_cast<size_t>(out.n_vocab), 0.0f);
+    out.word_start.assign(static_cast<size_t>(hp.pred_vocab), 0);
+    out.piece_ids.clear();
+    for (int id = 0; id < out.n_vocab && id < model.tok.n_tokens(); ++id) {
+        const std::string & piece                 = model.tok.token(id);
+        out.pieces[static_cast<size_t>(id)]       = piece;
+        out.piece_scores[static_cast<size_t>(id)] = model.tok.score(id);
+        out.word_start[static_cast<size_t>(id)]   = piece.rfind("\xE2\x96\x81", 0) == 0 ? 1 : 0;
+        if (!piece.empty() && !model.tok.is_strippable_special(id)) {
+            out.piece_ids.emplace(piece, id);
+        }
+    }
+
     return TRANSCRIBE_OK;
+}
+
+float rnnt_blank_penalty() {
+    if (const char * v = std::getenv("TRANSCRIBE_PARAKEET_BLANK_PENALTY"); v != nullptr && v[0] != '\0') {
+        return std::max(0.0f, std::strtof(v, nullptr));
+    }
+    return 0.0f;
 }
 
 // ---------------------------------------------------------------------------
 // LSTM state
 // ---------------------------------------------------------------------------
+
+void DecodeHistory::clear() {
+    first_frame = 0;
+    joint_h     = 0;
+    enc_proj.clear();
+    starts.clear();
+}
+
+const DecodeHistory::WordStart * DecodeHistory::start_at(int64_t token) const {
+    const auto it = std::lower_bound(starts.begin(), starts.end(), token,
+                                     [](const WordStart & s, int64_t t) { return s.token < t; });
+    return it != starts.end() && it->token == token ? &*it : nullptr;
+}
 
 void LstmState::reset(int n_layers, int pred_hidden) {
     h.resize(static_cast<size_t>(n_layers));
@@ -966,6 +1003,21 @@ int argmax_range(const float * data, int n) {
     return best_i;
 }
 
+// An RNN-T step's greedy choice with `blank_penalty` taken off the blank
+// logit; `logits` is left raw (token confidences read it).
+int pick_rnnt(const PhraseBoost *  boost,
+              int32_t              cursor,
+              std::vector<float> & logits,
+              int                  n_cls,
+              int                  blank_id,
+              float                blank_penalty) {
+    const float raw                       = logits[static_cast<size_t>(blank_id)];
+    logits[static_cast<size_t>(blank_id)] = raw - blank_penalty;
+    const int token = boost != nullptr ? boost->pick(cursor, logits.data()) : argmax_range(logits.data(), n_cls);
+    logits[static_cast<size_t>(blank_id)] = raw;
+    return token;
+}
+
 // Entropy-based confidence over a token-logit slice. Mirrors the
 // reference ParakeetTDT.decode_greedy path:
 //
@@ -1020,7 +1072,8 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                                     int                        T_enc,
                                     int                        d_enc,
                                     int                        n_threads,
-                                    std::vector<TdtToken> &    out_tokens) {
+                                    std::vector<TdtToken> &    out_tokens,
+                                    const PhraseBoost *        boost) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1038,6 +1091,10 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
     const int n_token_cls = w.predictor.pred_vocab;  // == vocab_size + 1
     const int n_dur       = static_cast<int>(w.tdt_durations.size());
     const int blank_id    = w.blank_id;
+
+    // Vocabulary boost (boost.h), when the run carries terms.
+    const bool boost_on     = boost != nullptr && !boost->empty() && boost->n_classes() == n_token_cls;
+    int32_t    boost_cursor = PhraseBoost::kRoot;
 
     // All-ggml decode on ONE shared threadpool: PredGraph owns the
     // backend + pool; enc_proj and the joint graph borrow it. pg is
@@ -1131,9 +1188,10 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
         const float * token_logits    = logits.data();
         const float * duration_logits = logits.data() + n_token_cls;
 
-        const int pred_token = argmax_range(token_logits, n_token_cls);
-        const int decision   = argmax_range(duration_logits, n_dur);
-        const int duration   = w.tdt_durations[static_cast<size_t>(decision)];
+        const int pred_token =
+            boost_on ? boost->pick(boost_cursor, token_logits) : argmax_range(token_logits, n_token_cls);
+        const int decision = argmax_range(duration_logits, n_dur);
+        const int duration = w.tdt_durations[static_cast<size_t>(decision)];
 
         // Optional dump of the first decode step (start state, encoder
         // frame 0): embed input, per-layer LSTM h, joint logits. Mirrors
@@ -1172,6 +1230,9 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
             last_token = pred_token;
             std::swap(state, next_state);  // commit
             predictor_dirty = true;
+            if (boost_on) {
+                boost_cursor = boost->advance(boost_cursor, pred_token);
+            }
         }
 
         if (global_budget) {
@@ -1254,7 +1315,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        T_enc,
                                      int                        d_enc,
                                      int                        n_threads,
-                                     std::vector<TdtToken> &    out_tokens) {
+                                     std::vector<TdtToken> &    out_tokens,
+                                     const PhraseBoost *        boost,
+                                     float                      blank_penalty) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1271,6 +1334,10 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
     const int H           = w.predictor.pred_hidden;
     const int n_token_cls = w.predictor.pred_vocab;  // == vocab + 1
     const int blank_id    = w.blank_id;
+
+    // Vocabulary boost (see decode_tdt_greedy).
+    const bool boost_on     = boost != nullptr && !boost->empty() && boost->n_classes() == n_token_cls;
+    int32_t    boost_cursor = PhraseBoost::kRoot;
 
     // Per-call decode graphs (see decode_tdt_greedy for the lifecycle).
     PredGraph  pg;
@@ -1342,7 +1409,8 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
 
         // RNNT joint output is just `n_token_cls` floats (no duration extras).
         const float * token_logits = logits.data();
-        const int     pred_token   = argmax_range(token_logits, n_token_cls);
+        const int     pred_token =
+            pick_rnnt(boost_on ? boost : nullptr, boost_cursor, logits, n_token_cls, blank_id, blank_penalty);
 
         if (iter == 1 && transcribe::debug::enabled()) {
             const long long s_h = H;
@@ -1377,6 +1445,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
             last_token = pred_token;
             std::swap(state, next_state);
             predictor_dirty = true;
+            if (boost_on) {
+                boost_cursor = boost->advance(boost_cursor, pred_token);
+            }
 
             new_symbols += 1;
             if (w.tdt_max_symbols > 0 && new_symbols >= w.tdt_max_symbols) {
@@ -1419,7 +1490,11 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                int &                      last_token_io,
                                                int                        frame_offset,
                                                int                        n_threads,
-                                               std::vector<TdtToken> &    out_tokens) {
+                                               std::vector<TdtToken> &    out_tokens,
+                                               const PhraseBoost *        boost,
+                                               int32_t &                  boost_cursor_io,
+                                               float                      blank_penalty,
+                                               DecodeHistory *            history) {
     if (enc_out == nullptr || T_enc_new <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1441,11 +1516,12 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
 
-    const int nt          = resolve_decode_threads(n_threads);
-    const int n_layers    = static_cast<int>(w.predictor.lstm.size());
-    const int H           = w.predictor.pred_hidden;
-    const int n_token_cls = w.predictor.pred_vocab;
-    const int blank_id    = w.blank_id;
+    const int  nt          = resolve_decode_threads(n_threads);
+    const int  n_layers    = static_cast<int>(w.predictor.lstm.size());
+    const int  H           = w.predictor.pred_hidden;
+    const int  n_token_cls = w.predictor.pred_vocab;
+    const int  blank_id    = w.blank_id;
+    const bool boost_on    = boost != nullptr && !boost->empty() && boost->n_classes() == n_token_cls;
 
     // Per-call decode graphs (see decode_tdt_greedy for the lifecycle).
     PredGraph  pg;
@@ -1462,12 +1538,14 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     // Validate state_io shape; reset if degenerate.
     if (static_cast<int>(state_io.h.size()) != n_layers || static_cast<int>(state_io.c.size()) != n_layers) {
         state_io.reset(n_layers, H);
-        last_token_io = -1;
+        last_token_io   = -1;
+        boost_cursor_io = PhraseBoost::kRoot;
     }
     for (int l = 0; l < n_layers; ++l) {
         if (static_cast<int>(state_io.h[l].size()) != H || static_cast<int>(state_io.c[l].size()) != H) {
             state_io.reset(n_layers, H);
-            last_token_io = -1;
+            last_token_io   = -1;
+            boost_cursor_io = PhraseBoost::kRoot;
             break;
         }
     }
@@ -1478,6 +1556,24 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     if (!precompute_enc_proj_ggml(w.joint, pg.backend, enc_out, T_enc_new, d_enc, enc_proj_all)) {
         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "parakeet decoder (rnnt-stream): enc_proj graph failed");
         return TRANSCRIBE_ERR_BACKEND;
+    }
+    if (history != nullptr) {
+        // A gap in the frames (a restarted stream) starts the history over.
+        if (history->joint_h != joint_h || history->end_frame() != frame_offset) {
+            history->clear();
+            history->joint_h     = joint_h;
+            history->first_frame = frame_offset;
+        }
+        history->enc_proj.insert(history->enc_proj.end(), enc_proj_all.begin(), enc_proj_all.end());
+        const int64_t excess = history->end_frame() - history->first_frame - DecodeHistory::kFrames;
+        if (excess > 0) {
+            history->enc_proj.erase(history->enc_proj.begin(),
+                                    history->enc_proj.begin() + static_cast<std::ptrdiff_t>(excess * joint_h));
+            history->first_frame += excess;
+            while (!history->starts.empty() && history->starts.front().frame < history->first_frame) {
+                history->starts.pop_front();
+            }
+        }
     }
 
     // Working state. On return, `state` (committed after the last
@@ -1491,9 +1587,10 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
     std::vector<float> scratch_probs;
     std::vector<float> logits;
 
-    int last_token  = last_token_io;
-    int step        = 0;
-    int new_symbols = 0;
+    int     last_token   = last_token_io;
+    int32_t boost_cursor = boost_cursor_io;
+    int     step         = 0;
+    int     new_symbols  = 0;
 
     const int max_iters = 16 * T_enc_new + 1024;
     int       iter      = 0;
@@ -1520,7 +1617,8 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
         }
 
         const float * token_logits = logits.data();
-        const int     pred_token   = argmax_range(token_logits, n_token_cls);
+        const int     pred_token =
+            pick_rnnt(boost_on ? boost : nullptr, boost_cursor, logits, n_token_cls, blank_id, blank_penalty);
 
         const bool is_blank = (pred_token == blank_id);
         if (is_blank) {
@@ -1533,11 +1631,23 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
             tok.p               = p;
             tok.step_at_emit    = frame_offset + step;
             tok.duration_frames = 1;
+            if (history != nullptr && static_cast<size_t>(pred_token) < w.word_start.size() &&
+                w.word_start[static_cast<size_t>(pred_token)] != 0) {
+                DecodeHistory::WordStart ws;
+                ws.token      = static_cast<int64_t>(out_tokens.size());
+                ws.frame      = tok.step_at_emit;
+                ws.prev_token = last_token;
+                ws.state      = state;
+                history->starts.push_back(std::move(ws));
+            }
             out_tokens.push_back(tok);
 
             last_token = pred_token;
             std::swap(state, next_state);
             predictor_dirty = true;
+            if (boost_on) {
+                boost_cursor = boost->advance(boost_cursor, pred_token);
+            }
 
             new_symbols += 1;
             if (w.tdt_max_symbols > 0 && new_symbols >= w.tdt_max_symbols) {
@@ -1554,9 +1664,255 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
 
     // Commit final state. After the loop, `state` is the post-last-
     // non-blank state (the predictor's "current" since the last emit).
-    state_io      = std::move(state);
-    last_token_io = last_token;
+    state_io        = std::move(state);
+    last_token_io   = last_token;
+    boost_cursor_io = boost_cursor;
     return TRANSCRIBE_OK;
+}
+
+namespace {
+
+// Cells (frames x token positions) score_tokens evaluates at most.
+constexpr int64_t kMaxScoreCells = 4096;
+
+double log_add(double a, double b) {
+    if (a < b) {
+        std::swap(a, b);
+    }
+    return b == -std::numeric_limits<double>::infinity() ? a : a + std::log1p(std::exp(b - a));
+}
+
+}  // namespace
+
+float score_tokens(const HostDecoderWeights &       w,
+                   const DecodeHistory &            history,
+                   const DecodeHistory::WordStart & start,
+                   int64_t                          last_frame,
+                   const std::vector<int32_t> &     tokens,
+                   int                              n_threads) {
+    constexpr float kNone    = -std::numeric_limits<float>::infinity();
+    const int       joint_h  = w.joint.joint_h;
+    const int       n_layers = static_cast<int>(w.predictor.lstm.size());
+    const int       H        = w.predictor.pred_hidden;
+    const int       n_cls    = w.predictor.pred_vocab;
+    const int64_t   first    = start.frame;
+    if (w.head_kind != HostHeadKind::RNNT || tokens.empty() || history.joint_h != joint_h ||
+        first < history.first_frame || last_frame < first || last_frame >= history.end_frame() ||
+        static_cast<int>(start.state.h.size()) != n_layers) {
+        return kNone;
+    }
+    const int F = static_cast<int>(last_frame - first + 1);
+    const int U = static_cast<int>(tokens.size());
+    if (static_cast<int64_t>(F) * (U + 1) > kMaxScoreCells) {
+        return kNone;
+    }
+    for (const int32_t t : tokens) {
+        if (t < 0 || t >= n_cls || t == w.blank_id) {
+            return kNone;
+        }
+    }
+
+    PredGraph  pg;
+    JointGraph jg;
+    build_pred_graph(pg, w.predictor, resolve_decode_threads(n_threads));
+    if (pg.ready) {
+        build_joint_graph(jg, w.joint, pg.backend);
+    }
+    if (!pg.ready || !jg.ready) {
+        return kNone;
+    }
+
+    // The predictor's output after each prefix of `tokens`.
+    std::vector<std::vector<float>> g(static_cast<size_t>(U) + 1);
+    LstmState                       state = start.state;
+    LstmState                       next;
+    next.reset(n_layers, H);
+    std::vector<float> scratch_x;
+    int                prev = start.prev_token;
+    for (int u = 0; u <= U; ++u) {
+        const float * out = predictor_step_ggml(w.predictor, pg, prev, state, next, scratch_x);
+        if (out == nullptr) {
+            return kNone;
+        }
+        g[static_cast<size_t>(u)].assign(out, out + H);
+        if (u < U) {
+            prev = tokens[static_cast<size_t>(u)];
+            std::swap(state, next);
+        }
+    }
+
+    // log P(blank) and log P(the next token) at every (frame, position).
+    const size_t       cols = static_cast<size_t>(U) + 1;
+    std::vector<float> lp_blank(static_cast<size_t>(F) * cols);
+    std::vector<float> lp_token(static_cast<size_t>(F) * cols);
+    std::vector<float> logits;
+    for (int i = 0; i < F; ++i) {
+        const float * enc = history.enc_proj.data() +
+                            static_cast<size_t>(first - history.first_frame + i) * static_cast<size_t>(joint_h);
+        for (int u = 0; u <= U; ++u) {
+            if (!joint_step(w.joint, jg, enc, g[static_cast<size_t>(u)].data(), logits)) {
+                return kNone;
+            }
+            const float max_v = *std::max_element(logits.begin(), logits.begin() + n_cls);
+            double      sum   = 0.0;
+            for (int c = 0; c < n_cls; ++c) {
+                sum += std::exp(static_cast<double>(logits[static_cast<size_t>(c)] - max_v));
+            }
+            const float  lse = max_v + static_cast<float>(std::log(sum));
+            const size_t at  = static_cast<size_t>(i) * cols + static_cast<size_t>(u);
+            lp_blank[at]     = logits[static_cast<size_t>(w.blank_id)] - lse;
+            lp_token[at]     = u < U ? logits[static_cast<size_t>(tokens[static_cast<size_t>(u)])] - lse : 0.0f;
+        }
+    }
+
+    // Forward over (frame, tokens emitted): a blank moves to the next
+    // frame, a token stays on the frame.
+    constexpr double    kNeg = -std::numeric_limits<double>::infinity();
+    std::vector<double> alpha(static_cast<size_t>(F) * cols, kNeg);
+    alpha[0] = 0.0;
+    for (int i = 0; i < F; ++i) {
+        for (int u = 0; u <= U; ++u) {
+            const size_t at = static_cast<size_t>(i) * cols + static_cast<size_t>(u);
+            if (i > 0) {
+                alpha[at] = log_add(alpha[at], alpha[at - cols] + lp_blank[at - cols]);
+            }
+            if (u > 0) {
+                alpha[at] = log_add(alpha[at], alpha[at - 1] + lp_token[at - 1]);
+            }
+        }
+    }
+    return static_cast<float>(alpha[static_cast<size_t>(F - 1) * cols + static_cast<size_t>(U)]);
+}
+
+namespace {
+
+// `text` in SentencePiece form: every word preceded by "▁".
+std::string sentencepiece_text(const std::string & text) {
+    static const std::string kSpace = "\xE2\x96\x81";
+    std::string              sp;
+    size_t                   i = 0;
+    while (i < text.size()) {
+        while (i < text.size() && std::isspace(static_cast<unsigned char>(text[i])) != 0) {
+            ++i;
+        }
+        const size_t j = text.find_first_of(" \t\n", i);
+        if (i < text.size()) {
+            sp += kSpace + text.substr(i, (j == std::string::npos ? text.size() : j) - i);
+        }
+        i = j == std::string::npos ? text.size() : j;
+    }
+    return sp;
+}
+
+}  // namespace
+
+std::vector<int32_t> model_pieces(const HostDecoderWeights &       w,
+                                  const DecodeHistory &            history,
+                                  const DecodeHistory::WordStart & start,
+                                  int64_t                          last_frame,
+                                  const std::string &              text,
+                                  int                              n_threads) {
+    const std::string sp       = sentencepiece_text(text);
+    const int         joint_h  = w.joint.joint_h;
+    const int         n_layers = static_cast<int>(w.predictor.lstm.size());
+    const int         H        = w.predictor.pred_hidden;
+    if (sp.empty() || w.head_kind != HostHeadKind::RNNT || history.joint_h != joint_h ||
+        start.frame < history.first_frame || last_frame < start.frame || last_frame >= history.end_frame() ||
+        static_cast<int>(start.state.h.size()) != n_layers) {
+        return {};
+    }
+    PredGraph  pg;
+    JointGraph jg;
+    build_pred_graph(pg, w.predictor, resolve_decode_threads(n_threads));
+    if (pg.ready) {
+        build_joint_graph(jg, w.joint, pg.backend);
+    }
+    if (!pg.ready || !jg.ready) {
+        return {};
+    }
+    LstmState state = start.state;
+    LstmState next;
+    next.reset(n_layers, H);
+    std::vector<float>   scratch_x;
+    std::vector<float>   logits;
+    std::vector<int32_t> out;
+    int                  prev      = start.prev_token;
+    int64_t              frame     = start.frame;
+    size_t               pos       = 0;
+    const float *        g         = predictor_step_ggml(w.predictor, pg, prev, state, next, scratch_x);
+    // Each piece of the text costs one step, each frame one blank.
+    const size_t         max_steps = sp.size() + static_cast<size_t>(last_frame - start.frame) + 1;
+    for (size_t step = 0; pos < sp.size() && g != nullptr && step < max_steps; ++step) {
+        const float * enc =
+            history.enc_proj.data() + static_cast<size_t>(frame - history.first_frame) * static_cast<size_t>(joint_h);
+        if (!joint_step(w.joint, jg, enc, g, logits)) {
+            return {};
+        }
+        int   best   = -1;
+        float best_v = -std::numeric_limits<float>::infinity();
+        for (int id = 0; id < static_cast<int>(w.pieces.size()); ++id) {
+            const std::string & piece = w.pieces[static_cast<size_t>(id)];
+            if (!piece.empty() && logits[static_cast<size_t>(id)] > best_v &&
+                sp.compare(pos, piece.size(), piece) == 0) {
+                best   = id;
+                best_v = logits[static_cast<size_t>(id)];
+            }
+        }
+        if (best < 0) {
+            return {};
+        }
+        if (frame < last_frame && logits[static_cast<size_t>(w.blank_id)] > best_v) {
+            ++frame;
+            continue;
+        }
+        out.push_back(best);
+        pos += w.pieces[static_cast<size_t>(best)].size();
+        prev = best;
+        std::swap(state, next);
+        g = predictor_step_ggml(w.predictor, pg, prev, state, next, scratch_x);
+    }
+    return pos == sp.size() ? out : std::vector<int32_t>{};
+}
+
+std::vector<int32_t> spell_pieces(const HostDecoderWeights & w, const std::string & text) {
+    const std::string sp = sentencepiece_text(text);
+    // Unigram Viterbi; without scores in the GGUF, the fewest pieces.
+    const bool scored    = std::any_of(w.piece_scores.begin(), w.piece_scores.end(), [](float v) { return v != 0.0f; });
+    size_t     longest   = 0;
+    for (const auto & p : w.pieces) {
+        longest = std::max(longest, p.size());
+    }
+    const size_t         n = sp.size();
+    std::vector<float>   best(n + 1, -std::numeric_limits<float>::infinity());
+    std::vector<int32_t> piece(n + 1, -1);
+    std::vector<size_t>  from(n + 1, 0);
+    best[0] = 0.0f;
+    for (size_t a = 0; a < n; ++a) {
+        if (!std::isfinite(best[a])) {
+            continue;
+        }
+        for (size_t len = 1; len <= longest && a + len <= n; ++len) {
+            const auto it = w.piece_ids.find(sp.substr(a, len));
+            if (it == w.piece_ids.end()) {
+                continue;
+            }
+            const float v = best[a] + (scored ? w.piece_scores[static_cast<size_t>(it->second)] : -1.0f);
+            if (v > best[a + len]) {
+                best[a + len]  = v;
+                piece[a + len] = it->second;
+                from[a + len]  = a;
+            }
+        }
+    }
+    if (!std::isfinite(best[n]) || n == 0) {
+        return {};
+    }
+    std::vector<int32_t> out;
+    for (size_t at = n; at > 0; at = from[at]) {
+        out.push_back(piece[at]);
+    }
+    std::reverse(out.begin(), out.end());
+    return out;
 }
 
 // CTC greedy decode.

@@ -27,6 +27,11 @@ speaker-tagged transcript (see
 This port runs the model in both **offline** and **cache-aware streaming**
 modes.
 
+**Prompting:** vocabulary (`--vocabulary`) as decoder-side term boosting in
+the greedy RNN-T decode, single-speaker and multitalker, offline and
+streaming; each speaker's decoder tracks its own match (see
+[prompting](../prompting.md)).
+
 See NVIDIA's [model card](https://huggingface.co/nvidia/multitalker-parakeet-streaming-0.6b-v1)
 for training data, intended use, the multitalker methodology, and the full
 latency-vs-accuracy table.
@@ -297,6 +302,61 @@ reproduces `transcribe_run` on the whole clip word for word.
 - **Lookahead.** `transcribe_parakeet_stream_ext::att_context_right` picks
   the menu entry: 13, 6, 1 or 0, i.e. 1.12 s, 0.56 s, 0.16 s or 0.08 s
   chunks. The diarizer runs on the same chunk grid.
+- **Gating hangover.** The reference selects a speaker for chunks where the
+  diarizer heard them within the last 2 chunks: 2.24 s at 1.12 s chunks but
+  0.32 s at 0.16 s chunks, shorter than the diarizer's dips inside running
+  speech and the decoder's emission delay (~0.45 s past a word's end), so
+  phrase endings before a pause went undecoded. Streams with shorter chunks
+  keep a speaker selected through silence for 2.24 s at 0.56 s and 0.16 s
+  chunks and 0.96 s at 0.08 s chunks, until another speaker's activity
+  passes 0.2 in the diarizer's latest chunk. Against the 2-chunk window
+  (F16, with the onset catch-up below), WER without vocabulary on ten
+  medical dictation clips goes from 9.3 % to 7.6 % at 0.16 s and from 9.0 % to 7.6 % at
+  0.08 s (unchanged at 0.56 s). On the full AMI ES2002a meeting cpWER goes
+  from 19.2 % to 18.4 % at 0.56 s and from 29.2 % to 27.0 % at 0.08 s, but
+  from 19.3 % to 20.0 % at 0.16 s, where cross-talk the hangover lets
+  through costs more than the deletions it saves (93 -> 79).
+  `TRANSCRIBE_MULTITALKER_GATE_FRAMES` (encoder frames) overrides the
+  hangover; the 1.12 s operating point, and `transcribe_run`, are unchanged.
+- **Onset catch-up and restart after pauses.** Gating opens a speaker once
+  the diarizer's activity for them passes 0.5, typically 0.3-0.6 s into what
+  they say. At 1.12 s chunks the onset falls inside the first gated chunk;
+  at 0.16 s and 0.08 s chunks the first words were lost ("due to multiple
+  sclerosis" -> "to multiple sclerosis"). Short-chunk streams now first feed
+  the chunks a speaker's instance skipped right before its gate opened: up
+  to 1.28 s at 0.16 s chunks and 0.96 s at 0.08 s, and none in which another
+  speaker was heard. After 4 s in which nobody was heard (3 s at 0.08 s
+  chunks), a speaker who resumes also restarts from zeroed caches and a
+  fresh decoder state, keeping their transcript, since an instance resumed
+  from stale context could lose seconds of speech; and their catch-up then
+  takes chunks the diarizer gave to another slot, since it can put the first
+  chunk after a pause on the wrong one. On ten medical dictation clips at
+  0.16 s (F16, no vocabulary) WER goes from 9.9 % to 7.6 % on single clips and from
+  14.9 % to 10.0 % on the clips joined into 4-minute streams with 4 s
+  pauses; on the full AMI ES2002a meeting cpWER goes from 19.6 % to 20.0 %
+  and latency P50 from 0.35 s to 0.39 s, since a restarted instance emits
+  later until its cache refills. `TRANSCRIBE_MULTITALKER_CATCHUP_FRAMES`
+  (encoder frames) and `TRANSCRIBE_MULTITALKER_RESTART_MS` override them
+  (`0` = off).
+- **Blank stalls.** Over long continuous dictation at 0.16 s chunks the
+  RNN-T can settle on blank and skip a whole sentence, typically right after
+  a sentence end (4 of 60 medical dictation clips, 38-45 s in). The offline
+  decode at the same lookahead skips the same sentences, so this is the
+  model's behaviour, not the streaming path's; a fresh decoder state alone
+  does not bring the sentence back, a fresh stream from a few seconds
+  before does. The next word trails blank by under a nat at its onset:
+  `TRANSCRIBE_PARAKEET_BLANK_PENALTY=1` recovers every one (medical
+  dictation WER without vocabulary 6.1 % -> 5.3 %, F16) and is what
+  multitalk runs with; the default stays 0, the reference decode.
+- **Scoring alternatives.** `transcribe_stream_score_alternatives`
+  (`transcribe/experimental.h`, outside the ABI-pinned surface) gives the
+  model's log-probability of candidate spellings for a stretch of a
+  speaker's words, against the words as transcribed: each speaker's decoder
+  keeps its encoder projections and the predictor state at every word start
+  (about 6 minutes), and a candidate is scored by RNN-T forced alignment
+  over the same frames, spelled both the way the model's own greedy decode
+  would spell it and by the vocabulary's unigram scores. It works on the
+  active stream and on a finished one until the next stream begins.
 - **Text.** Rows are rewritten as speakers grow and the merged `full_text`
   is in segment order, so nothing commits before finalize: `committed_text`
   stays empty during the stream and `tentative_text` holds the merged text.
@@ -304,6 +364,14 @@ reproduces `transcribe_run` on the whole clip word for word.
   for speaker-attributed output.
 - **Memory.** Bounded per active speaker (its caches plus one retained
   chunk graph), plus the diarizer's accumulated predictions.
+- **Single speaker.** Without `diarize = ON` the bundle streams its
+  single-speaker ASR path, whose snapshot now carries words and one
+  segment as well as tokens (words split on SentencePiece boundaries, the
+  last one possibly still growing); it used to carry tokens and text only.
+  Nothing is gated, so for one speaker it needs no onset catch-up; on 60
+  medical dictation clips at 0.16 s it scores 5.1 % WER (F16, no
+  vocabulary, blank penalty 1), against 5.3 % for the speaker-attributed
+  stream.
 
 ## Known limitations
 

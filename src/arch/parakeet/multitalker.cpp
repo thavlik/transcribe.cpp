@@ -13,10 +13,13 @@
 //      each ASR instance.
 //   2. Active speakers = columns whose activity has exceeded 0.5.
 //   3. One cache-aware ASR instance per active speaker, advanced only on
-//      the chunks where the reference's cache gating selects that speaker,
-//      with that speaker's supervision: kernel mode (masked_asr=False, the
-//      default here) drives the layer-0 speaker-kernel injection; masked
-//      mode (masked_asr=True, the NeMo example default, selected via
+//      the chunks where the reference's cache gating selects that speaker
+//      (at 160 / 80 ms chunks also through a hangover and the chunks just
+//      before an onset, and restarted after a pause of the conversation;
+//      see chunk_active and catchup_chunks), with that speaker's
+//      supervision: kernel mode (masked_asr=False, the default here)
+//      drives the layer-0 speaker-kernel injection; masked mode
+//      (masked_asr=True, the NeMo example default, selected via
 //      TRANSCRIBE_MULTITALKER_MODE=masked) masks mel features.
 //   4. Per-speaker results merge into one speaker-tagged result: segments
 //      ordered by start time with speaker_id set, words/tokens re-indexed
@@ -83,7 +86,12 @@ struct SpeakerInstance {
     ggml_context *                compute_ctx = nullptr;
     std::vector<TdtToken>         raw;
     std::vector<int32_t>          fed;  // absolute enc frame per gathered frame
-    bool                          started = false;
+    bool                          started    = false;
+    // Grid index of the next chunk this instance has not been fed (catch-up
+    // never re-feeds a chunk).
+    int64_t                       next_chunk = 0;
+    // Restart before the next chunk (see catchup_chunks).
+    bool                          restart    = false;
 
     // Streaming snapshots: the speaker's result as last built, and the raw
     // token count it was built from (rebuilt only when tokens arrive).
@@ -145,6 +153,8 @@ void free_instance(SpeakerInstance & I) noexcept {
     I.caches.last_v.clear();
     I.caches.initialized = false;
     I.started            = false;
+    I.next_chunk         = 0;
+    I.restart            = false;
 }
 
 // The chunk grid shared by the diarizer and every speaker's encoder (NeMo
@@ -154,14 +164,23 @@ void free_instance(SpeakerInstance & I) noexcept {
 // continuous pre_encode) and drops drop_sub pre-encode frames. At [70, 13]:
 // 105 / 112 / 9 / 2, i.e. 14 encoder frames (1.12 s) per chunk.
 struct ChunkGrid {
-    int att_left  = 0;
-    int att_right = 0;
-    int chunk_enc = 0;  // encoder (= diarizer) frames per chunk: R + 1
-    int sub       = 0;  // mel columns per encoder frame
-    int mel_first = 0;
-    int mel_chunk = 0;
-    int mel_cache = 0;
-    int drop_sub  = 0;
+    int  att_left     = 0;
+    int  att_right    = 0;
+    int  chunk_enc    = 0;  // encoder (= diarizer) frames per chunk: R + 1
+    int  sub          = 0;  // mel columns per encoder frame
+    int  mel_first    = 0;
+    int  mel_chunk    = 0;
+    int  mel_cache    = 0;
+    int  drop_sub     = 0;
+    // Cache-gating hangover in encoder frames, and whether it also runs
+    // through other speakers' speech (see chunk_active).
+    int  gate_frames  = 0;
+    bool gate_through = false;
+    // Onset catch-up depth in chunks, and the conversation pause (encoder
+    // frames) after which a reopening speaker restarts; 0 = off (see
+    // catchup_chunks).
+    int  catchup      = 0;
+    int  pause_frames = 0;
 
     // First NEW mel column of chunk k, its new-column count, its history
     // prepend and its pre-encode drop.
@@ -174,16 +193,156 @@ struct ChunkGrid {
     int drop(int64_t k) const { return k == 0 ? 0 : drop_sub; }
 };
 
+// Reference cache gating looks back over the last 2 chunks
+// (cache_gating_buffer_size=2): 2.24 s at the default [70, 13] operating
+// point, but only 0.32 s at 160 ms chunks. That is shorter than the
+// diarizer's dips inside running speech and than the decoder's emission
+// delay at that lookahead (~0.45 s past the end of a word), so a speaker
+// loses the audio between flickers and the tail of every phrase before a
+// pause ("hydrochlorothiazide" -> "hydrochloroth"). Streams with shorter
+// chunks than the reference therefore keep a speaker's instance running for
+// a hangover after the speaker was last heard, but only through silence:
+// once another speaker's activity passes kHangoverCut in the latest
+// diarizer chunk, the 2-chunk window applies, since a kept-alive instance
+// transcribes whoever is talking. (At the speaker threshold, 0.5, the
+// hangover ran into the next speaker's first words, before the diarizer was
+// sure of them.)
+//
+// Hangover per lookahead (kernel mode, F16; 160 / 80 ms with the onset
+// catch-up below), against the 2-chunk window: WER without vocabulary on
+// ten medical dictation clips, cpWER on the full AMI ES2002a meeting.
+//   560 ms chunks: 2.24 s (28 frames). Dictation 9.0 % either way (3.4 % ->
+//                  3.1 % with the vocabulary), AMI 19.2 % -> 18.4 %; 1.68 s
+//                  and 3.36 s scored 19.2 % and 18.6 %.
+//   160 ms chunks: 2.24 s (28 frames). Dictation 9.3 % -> 7.6 %, AMI
+//                  19.3 % -> 20.0 % (deletions 93 -> 79, insertions
+//                  278 -> 308). 0.96 s and 1.6 s score the same on
+//                  dictation and 19.8 % on AMI.
+//    80 ms chunks: 0.96 s (12 frames). Dictation 9.0 % -> 7.6 % (the last
+//                  word before a pause, "for hyper" -> "for
+//                  hypertension"), AMI 29.2 % -> 27.0 %; with the cut at
+//                  0.5, AMI 28.3 %.
+//  1120 ms chunks: none. The 2-chunk window already spans 2.24 s, and
+//                  [70, 13] stays exactly the reference.
+// TRANSCRIBE_MULTITALKER_GATE_FRAMES overrides the hangover (encoder
+// frames; at most the 2-chunk window disables it) and
+// TRANSCRIBE_MULTITALKER_GATE_MODE=window also runs it through other
+// speakers' speech (experiments).
+int default_hangover_frames(int chunk_enc) {
+    switch (chunk_enc) {
+        case 7:
+        case 2:
+            return 28;
+        case 1:
+            return 12;
+        default:
+            return 0;
+    }
+}
+
+// Another speaker's activity that ends a hangover (see default_hangover_frames).
+constexpr float kHangoverCut = 0.2f;
+
+int gate_window_frames(int chunk_enc) {
+    int frames = default_hangover_frames(chunk_enc);
+    if (const char * v = std::getenv("TRANSCRIBE_MULTITALKER_GATE_FRAMES"); v != nullptr && v[0] != '\0') {
+        frames = std::atoi(v);
+    }
+    return std::max(frames, 2 * chunk_enc);
+}
+
+bool gate_through_speech() {
+    const char * v = std::getenv("TRANSCRIBE_MULTITALKER_GATE_MODE");
+    return v != nullptr && std::strcmp(v, "window") == 0;
+}
+
+// Onset catch-up and restart after a pause, on short-chunk grids (160 / 80
+// ms; 560 / 1120 ms stay the reference).
+//
+// Catch-up: gating opens a speaker's decoder once the diarizer's activity
+// for them passes 0.5, typically 0.3-0.6 s into what they say. At 1120 / 560
+// ms the onset falls inside the first gated chunk; at 160 / 80 ms it is lost
+// ("due to multiple sclerosis" -> "to multiple sclerosis"). Whenever gating
+// opens, the chunks the speaker's instance skipped right before it are fed
+// first, with the target's raw activity as supervision, back to the catch-up
+// depth or a chunk another speaker was heard in. The burst (up to 8 / 12
+// chunks of one speaker's encoder) runs in the feed that opens the gate.
+//
+// Restart: an instance that sat out a pause of the whole conversation
+// resumes from stale context and can lose seconds of what its speaker says
+// next. When nobody was heard for the restart pause before a speaker's gate
+// opens, their instance restarts from zeroed encoder caches and a fresh
+// decoder state, keeping its transcript and timeline; it then emits a few
+// tenths of a second later until its cache refills.
+//
+// Defaults, neither -> both (F16, kernel mode): WER without vocabulary on
+// ten medical dictation clips / on those clips joined into 4-minute streams
+// with 4 s pauses, then cpWER and latency P50 on the full AMI ES2002a
+// meeting.
+//   160 ms chunks: catch-up 1.28 s (16 frames), restart after 4 s.
+//                  9.9 % -> 7.6 % / 14.9 % -> 10.0 % / 19.6 % -> 20.0 %,
+//                  0.35 s -> 0.39 s.
+//    80 ms chunks: catch-up 0.96 s (12 frames), restart after 3 s.
+//                  10.7 % -> 7.6 % / 19.5 % -> 10.4 % / 29.5 % -> 27.0 %,
+//                  0.30 s -> 0.38 s.
+// Pause choice (paused streams / AMI, P50): 3 s at 160 ms scores 10.0 % /
+// 20.2 %, 0.43 s; 4 s at 80 ms 11.0 % / 27.4 %, 0.33 s. Catch-up without
+// restarts scores 16.7 % / 15.9 % on the paused streams, worse than neither
+// at 160 ms.
+// TRANSCRIBE_MULTITALKER_CATCHUP_FRAMES (encoder frames) and
+// TRANSCRIBE_MULTITALKER_RESTART_MS override them on these grids; 0 turns
+// either off.
+int catchup_chunks(int chunk_enc) {
+    int frames = 0;
+    switch (chunk_enc) {
+        case 2:
+            frames = 16;
+            break;
+        case 1:
+            frames = 12;
+            break;
+        default:
+            break;
+    }
+    if (const char * v = std::getenv("TRANSCRIBE_MULTITALKER_CATCHUP_FRAMES"); v != nullptr && v[0] != '\0') {
+        frames = std::atoi(v);
+    }
+    return std::max(0, frames) / std::max(1, chunk_enc);
+}
+
+// The restart pause in encoder frames (see catchup_chunks).
+int restart_pause_frames(int chunk_enc) {
+    int ms = 0;
+    switch (chunk_enc) {
+        case 2:
+            ms = 4000;
+            break;
+        case 1:
+            ms = 3000;
+            break;
+        default:
+            break;
+    }
+    if (const char * v = std::getenv("TRANSCRIBE_MULTITALKER_RESTART_MS"); v != nullptr && v[0] != '\0') {
+        ms = std::atoi(v);
+    }
+    return std::max(0, ms) / 80;
+}
+
 ChunkGrid make_grid(const ParakeetHParams & hp, int att_left, int att_right) {
     ChunkGrid g;
-    g.att_left  = att_left;
-    g.att_right = att_right;
-    g.chunk_enc = att_right + 1;
-    g.sub       = hp.enc_subsampling_factor;
-    g.mel_first = hp.enc_stream_sampling_frames_first + g.sub * att_right;
-    g.mel_chunk = g.chunk_enc * g.sub;
-    g.mel_cache = hp.enc_stream_pre_encode_cache_size;
-    g.drop_sub  = hp.enc_stream_drop_extra_pre_encoded;
+    g.att_left     = att_left;
+    g.att_right    = att_right;
+    g.chunk_enc    = att_right + 1;
+    g.sub          = hp.enc_subsampling_factor;
+    g.mel_first    = hp.enc_stream_sampling_frames_first + g.sub * att_right;
+    g.mel_chunk    = g.chunk_enc * g.sub;
+    g.mel_cache    = hp.enc_stream_pre_encode_cache_size;
+    g.drop_sub     = hp.enc_stream_drop_extra_pre_encoded;
+    g.gate_frames  = gate_window_frames(g.chunk_enc);
+    g.gate_through = gate_through_speech();
+    g.catchup      = g.chunk_enc <= 2 ? catchup_chunks(g.chunk_enc) : 0;
+    g.pause_frames = g.chunk_enc <= 2 ? restart_pause_frames(g.chunk_enc) : 0;
     return g;
 }
 
@@ -218,17 +377,39 @@ bool multitalker_use_kernel() {
 }
 
 // Reference cache_gating: speaker s is active in chunk k iff the max of its
-// accumulated preds over the last 2 chunks (incl. current) exceeds 0.5.
-// Applies to BOTH supervision modes (the reference instance selection is
-// mode-independent).
-bool chunk_active(const float * probs, int T_diar, int n_spk, int chunk_enc, int s, int64_t k) {
-    const int64_t begin = std::max<int64_t>(0, (k - 1) * chunk_enc);
-    const int64_t end   = std::min<int64_t>((k + 1) * chunk_enc, T_diar);
-    float         mx    = 0.0f;
-    for (int64_t t = begin; t < end; ++t) {
-        mx = std::max(mx, probs[static_cast<size_t>(t) * n_spk + s]);
+// accumulated preds over the last 2 chunks (incl. current) exceeds 0.5. On
+// top of that, a speaker heard within the last g.gate_frames stays active
+// while no other speaker's activity passes kHangoverCut (see
+// default_hangover_frames). Applies to BOTH
+// supervision modes (the reference instance selection is mode-independent).
+bool chunk_active(const float * probs, int T_diar, int n_spk, const ChunkGrid & g, int s, int64_t k) {
+    const int64_t end      = std::min<int64_t>((k + 1) * g.chunk_enc, T_diar);
+    auto          heard_in = [&](int spk, int64_t from) {
+        for (int64_t t = std::max<int64_t>(0, from); t < end; ++t) {
+            if (probs[static_cast<size_t>(t) * n_spk + spk] > 0.5f) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (heard_in(s, (k - 1) * g.chunk_enc)) {
+        return true;
     }
-    return mx > 0.5f;
+    if (g.gate_frames <= 2 * g.chunk_enc || !heard_in(s, (k + 1) * g.chunk_enc - g.gate_frames)) {
+        return false;
+    }
+    if (!g.gate_through) {
+        // The latest chunk the diarizer has produced: at 80 ms the current
+        // chunk's frame is not out yet when the ASR runs.
+        for (int64_t t = std::max<int64_t>(0, end - g.chunk_enc); t < end; ++t) {
+            for (int o = 0; o < n_spk; ++o) {
+                if (o != s && probs[static_cast<size_t>(t) * n_spk + o] > kHangoverCut) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
 }
 
 // Add every speaker whose preds in [t0, t1) exceed 0.5 to `active`
@@ -263,6 +444,16 @@ transcribe_status feed_instance(ParakeetSession * pc,
                                 int               mask_len,
                                 int               t_enc0) {
     InstanceScope scope(pc, I);
+    if (I.started && I.restart) {
+        // As on the first chunk, but the timeline continues. (A fresh decoder
+        // over the stale encoder caches does worse than no restart.)
+        zero_streaming_caches(pc);
+        pc->stream_caches.channel_len = 0;
+        const int64_t offset          = pc->stream_dec_state.frame_offset;
+        reset_streaming_decoder_state(pc, pm);
+        pc->stream_dec_state.frame_offset = offset;
+    }
+    I.restart = false;
     if (!I.started) {
         if (const transcribe_status st = init_streaming_caches(pc, pm); st != TRANSCRIBE_OK) {
             return st;
@@ -306,8 +497,32 @@ struct AsrChunk {
     int64_t       c0_new = 0;
 };
 
+// True if a speaker in `active` other than s was heard in chunk c.
+bool other_heard(const float *            probs,
+                 int                      T_diar,
+                 int                      n_spk,
+                 const ChunkGrid &        g,
+                 const std::vector<int> & active,
+                 int                      s,
+                 int64_t                  c) {
+    const int64_t end = std::min<int64_t>((c + 1) * g.chunk_enc, T_diar);
+    for (const int o : active) {
+        if (o == s) {
+            continue;
+        }
+        for (int64_t t = c * g.chunk_enc; t < end; ++t) {
+            if (probs[static_cast<size_t>(t) * n_spk + o] > 0.5f) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Run ASR chunk ch.k for every speaker the cache gating selects, each with
-// its own supervision. probs is the diarizer's row-major [T_diar, n_spk].
+// its own supervision, after the chunks a newly selected speaker skipped
+// just before (onset catch-up, see catchup_chunks). probs is the diarizer's
+// row-major [T_diar, n_spk].
 transcribe_status run_asr_chunk(ParakeetSession *              pc,
                                 ParakeetModel *                pm,
                                 const ChunkGrid &              g,
@@ -319,11 +534,7 @@ transcribe_status run_asr_chunk(ParakeetSession *              pc,
                                 int                            n_spk,
                                 bool                           use_kernel,
                                 std::vector<float> &           chunk_buf) {
-    const int n_feed   = static_cast<int>(ch.c1 - ch.c0);
-    const int advance  = static_cast<int>(ch.c1 - ch.c0_new);
-    const int ce       = g.chunk_enc;
-    const int t_enc0   = static_cast<int>(ch.k * ce);
-    const int mask_len = std::max(0, std::min(ce, T_diar - t_enc0));
+    const int ce = g.chunk_enc;
 
     // TRANSCRIBE_MULTITALKER_REF_BG_COMPAT=1 reproduces the reference
     // harness's background-slot indexing bug
@@ -334,18 +545,21 @@ transcribe_status run_asr_chunk(ParakeetSession *              pc,
     // only — the default is the intended union of the other ACTIVE slots.
     static const bool ref_bg_compat = (std::getenv("TRANSCRIBE_MULTITALKER_REF_BG_COMPAT") != nullptr);
 
-    std::vector<float> spk_vals(static_cast<size_t>(mask_len));
-    std::vector<float> bg_vals(static_cast<size_t>(mask_len));
+    std::vector<float> spk_vals(static_cast<size_t>(ce));
+    std::vector<float> bg_vals(static_cast<size_t>(ce));
 
-    for (const int s : active) {
-        if (!chunk_active(probs, T_diar, n_spk, ce, s, ch.k)) {
-            continue;
-        }
+    // Feed chunk k (mel columns [c0, c1), new from c0_new) to speaker s.
+    // `catchup`: a chunk from before gating opened (onset catch-up).
+    auto feed = [&](int s, int64_t k, int64_t c0, int64_t c1, int64_t c0_new, bool catchup) {
+        const int n_feed   = static_cast<int>(c1 - c0);
+        const int advance  = static_cast<int>(c1 - c0_new);
+        const int t_enc0   = static_cast<int>(k * ce);
+        const int mask_len = std::max(0, std::min(ce, T_diar - t_enc0));
 
         // Slice this chunk's mel columns (shared grid; the history prepend
         // reproduces the continuous pre_encode).
         chunk_buf.resize(static_cast<size_t>(ch.n_mels) * static_cast<size_t>(n_feed));
-        const int64_t rel = ch.c0 - ch.col0;
+        const int64_t rel = c0 - ch.col0;
         for (int m = 0; m < ch.n_mels; ++m) {
             std::memcpy(chunk_buf.data() + static_cast<size_t>(m) * n_feed,
                         ch.mel + static_cast<size_t>(m) * static_cast<size_t>(ch.n_cols) + static_cast<size_t>(rel),
@@ -358,14 +572,15 @@ transcribe_status run_asr_chunk(ParakeetSession *              pc,
         //   0 -> mask_value; the upsampled mask is left-aligned to
         //   the chunk's NEW columns (col j -> chunk frame j/8) and
         //   the short side is left-PADDED WITH 0, so the history
-        //   prepend columns are always masked.
+        //   prepend columns are always masked. A catch-up chunk keeps
+        //   its new columns.
         if (!use_kernel) {
-            const int hist = static_cast<int>(ch.c0_new - ch.c0);  // 9 (0 for the first chunk)
+            const int hist = static_cast<int>(c0_new - c0);  // 9 (0 for the first chunk)
             for (int c = 0; c < n_feed; ++c) {
                 bool keep = false;
                 if (c >= hist) {
                     const int f = t_enc0 + (c - hist) / g.sub;
-                    keep        = f < T_diar && probs[static_cast<size_t>(f) * n_spk + s] > 0.5f;
+                    keep        = f < T_diar && (catchup || probs[static_cast<size_t>(f) * n_spk + s] > 0.5f);
                 }
                 for (int m = 0; m < ch.n_mels; ++m) {
                     float & v = chunk_buf[static_cast<size_t>(m) * n_feed + c];
@@ -380,7 +595,9 @@ transcribe_status run_asr_chunk(ParakeetSession *              pc,
 
         // Kernel mode: per-chunk supervision over the NEW enc frames: raw
         // sigmoids for the target, binarized union of the other active
-        // speakers for the background.
+        // speakers for the background. A catch-up chunk keeps the target's
+        // raw activity too: lifting it to 0.5 cost accuracy (ten medical
+        // dictation clips, 160 ms: 2.3 % -> 3.1 % WER).
         const float * spk_ptr = nullptr;
         const float * bg_ptr  = nullptr;
         if (use_kernel && mask_len > 0) {
@@ -393,7 +610,7 @@ transcribe_status run_asr_chunk(ParakeetSession *              pc,
                     // active list to the SLOT id.
                     int n_act_k = 0;
                     for (const int o : active) {
-                        n_act_k += chunk_active(probs, T_diar, n_spk, ce, o, ch.k) ? 1 : 0;
+                        n_act_k += chunk_active(probs, T_diar, n_spk, g, o, k) ? 1 : 0;
                     }
                     for (int slot = 0; slot < n_act_k; ++slot) {
                         if (slot != s && probs[row + slot] > 0.5f) {
@@ -413,9 +630,67 @@ transcribe_status run_asr_chunk(ParakeetSession *              pc,
             bg_ptr  = bg_vals.data();
         }
 
-        if (const transcribe_status st =
-                feed_instance(pc, pm, g, inst[static_cast<size_t>(s)], chunk_buf.data(), n_feed, g.drop(ch.k), advance,
-                              spk_ptr, bg_ptr, mask_len, t_enc0);
+        SpeakerInstance &       I  = inst[static_cast<size_t>(s)];
+        const transcribe_status st = feed_instance(pc, pm, g, I, chunk_buf.data(), n_feed, g.drop(k), advance, spk_ptr,
+                                                   bg_ptr, mask_len, t_enc0);
+        I.next_chunk               = k + 1;
+        return st;
+    };
+
+    for (const int s : active) {
+        if (!chunk_active(probs, T_diar, n_spk, g, s, ch.k)) {
+            continue;
+        }
+        SpeakerInstance & I = inst[static_cast<size_t>(s)];
+
+        // A pause of the whole conversation before this chunk: nobody heard
+        // for the restart pause (or since the stream began) before the
+        // gate's 2-chunk window, which holds the onset that opened the gate.
+        // A speaker who resumes after one restarts.
+        bool paused = false;
+        if (g.pause_frames > 0 && I.next_chunk < ch.k) {
+            const int64_t t1 = std::max<int64_t>(0, (ch.k - 1) * ce);
+            const int64_t t0 = std::max<int64_t>(0, t1 - g.pause_frames);
+            paused           = true;
+            for (int64_t t = t0; t < std::min<int64_t>(t1, T_diar) && paused; ++t) {
+                for (int o = 0; o < n_spk && paused; ++o) {
+                    paused = probs[static_cast<size_t>(t) * n_spk + o] <= 0.5f;
+                }
+            }
+        }
+        if (paused && I.started) {
+            I.restart = true;
+            log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "parakeet multitalker: speaker %d restarts at chunk %lld", s,
+                    static_cast<long long>(ch.k));
+        }
+
+        // Onset catch-up: the chunks right before this one that the
+        // instance skipped, back to the depth, a chunk another speaker was
+        // heard in, or the oldest chunk the mel window still holds. After a
+        // pause, though, the diarizer may give the first chunk of speech to
+        // another slot before it settles on this one, so there another
+        // speaker's chunk does not stop the catch-up.
+        int64_t from = ch.k;
+        for (int64_t c = ch.k - 1; c >= std::max<int64_t>(I.next_chunk, ch.k - g.catchup); --c) {
+            if (g.new_col(c) - g.history(c) < ch.col0 ||
+                (!paused && other_heard(probs, T_diar, n_spk, g, active, s, c))) {
+                break;
+            }
+            from = c;
+        }
+        if (from < ch.k) {
+            log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "parakeet multitalker: speaker %d catches up chunks %lld-%lld", s,
+                    static_cast<long long>(from), static_cast<long long>(ch.k - 1));
+        }
+        for (int64_t c = from; c < ch.k; ++c) {
+            const int64_t c0_new = g.new_col(c);
+            if (const transcribe_status st =
+                    feed(s, c, c0_new - g.history(c), c0_new + g.advance(c), c0_new, /*catchup=*/true);
+                st != TRANSCRIBE_OK) {
+                return st;
+            }
+        }
+        if (const transcribe_status st = feed(s, ch.k, ch.c0, ch.c1, ch.c0_new, /*catchup=*/false);
             st != TRANSCRIBE_OK) {
             return st;
         }
@@ -826,7 +1101,7 @@ transcribe_status run_multitalker(ParakeetSession *             pc,
                 // at the tail; run_one_shot_inner clamps to the true length.
                 pass.keep_enc_frames.reserve(static_cast<size_t>(T_diar) + 1);
                 for (int k = 0; k < n_chunks; ++k) {
-                    if (chunk_active(probs.data(), T_diar, n_spk, chunk, s, k)) {
+                    if (chunk_active(probs.data(), T_diar, n_spk, g, s, k)) {
                         const int end     = std::min((k + 1) * chunk, T_diar);
                         const int enc_end = (k == n_chunks - 1) ? end + 1 : end;
                         for (int t = k * chunk; t < enc_end; ++t) {
@@ -1158,11 +1433,13 @@ transcribe_status multitalker_stream_feed(ParakeetSession *          pc,
         }
         pc->t_encode_us += ggml_time_us() - t_enc_start;
 
-        // Keep what the next chunk's windows read, plus one hop: the
-        // pre-emphasis filter reads the sample before every window.
-        const int64_t need_col  = S.grid.new_col(S.asr_chunks) - S.grid.history(S.asr_chunks);
-        int64_t       keep_from = need_col * hop - pm->hparams.fe_n_fft / 2 - hop;
-        keep_from               = (std::max<int64_t>(0, keep_from) / hop) * hop;
+        // Keep what the next chunk's windows read, and the catch-up chunks
+        // before it, plus one hop: the pre-emphasis filter reads the sample
+        // before every window.
+        const int64_t keep_chunk = std::max<int64_t>(0, S.asr_chunks - S.grid.catchup);
+        const int64_t need_col   = S.grid.new_col(keep_chunk) - S.grid.history(keep_chunk);
+        int64_t       keep_from  = need_col * hop - pm->hparams.fe_n_fft / 2 - hop;
+        keep_from                = (std::max<int64_t>(0, keep_from) / hop) * hop;
         if (keep_from > S.pcm_start) {
             const int64_t drop = std::min<int64_t>(keep_from - S.pcm_start, static_cast<int64_t>(S.pcm.size()));
             S.pcm.erase(S.pcm.begin(), S.pcm.begin() + static_cast<ptrdiff_t>(drop));
@@ -1187,6 +1464,33 @@ transcribe_status multitalker_stream_feed(ParakeetSession *          pc,
     pc->stream_audio_committed_us = samples_to_us(pm, S.grid.new_col(S.asr_chunks) * hop);
     fill_update(pc, update, changed, false);
     return TRANSCRIBE_OK;
+}
+
+bool multitalker_speaker_decode(const ParakeetSession *                             pc,
+                                int                                                 speaker,
+                                const DecodeHistory **                              history,
+                                const std::vector<TdtToken> **                      raw,
+                                const std::vector<transcribe_session::WordEntry> ** words) {
+    if (pc->mt_stream != nullptr) {
+        const MultitalkerStream & S = *pc->mt_stream;
+        const size_t              s = static_cast<size_t>(speaker - 1);
+        if (speaker < 1 || s >= S.inst.size() || !S.inst[s].has_built) {
+            return false;
+        }
+        *history = &S.inst[s].dec.history;
+        *raw     = &S.inst[s].raw;
+        *words   = &S.inst[s].built.words;
+        return true;
+    }
+    for (const auto & kept : pc->scoring) {
+        if (kept.speaker == speaker) {
+            *history = &kept.history;
+            *raw     = &kept.raw;
+            *words   = &kept.words;
+            return true;
+        }
+    }
+    return false;
 }
 
 transcribe_status multitalker_stream_finalize(ParakeetSession *          pc,
@@ -1284,7 +1588,21 @@ transcribe_status multitalker_stream_finalize(ParakeetSession *          pc,
     pc->t_decode_us += ggml_time_us() - t_build_start;
 
     // The stream is over: release the instances and the diarizer now
-    // rather than at the next begin. The snapshot lives on the session.
+    // rather than at the next begin. The snapshot lives on the session, and
+    // what stream_score needs of each speaker until the next begin.
+    pc->scoring.clear();
+    for (const int s : S.active) {
+        SpeakerInstance & I = S.inst[static_cast<size_t>(s)];
+        if (!I.has_built) {
+            continue;
+        }
+        ParakeetSession::ScoringSpeaker kept;
+        kept.speaker = s + 1;
+        kept.history = std::move(I.dec.history);
+        kept.raw     = std::move(I.raw);
+        kept.words   = std::move(I.built.words);
+        pc->scoring.push_back(std::move(kept));
+    }
     pc->mt_stream.reset();
 
     pc->stream_audio_committed_us = pc->stream_audio_input_us;

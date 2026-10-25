@@ -119,6 +119,9 @@ class Tokenizer {
 
     const std::string & token(int id) const;
     int                 find(const std::string & piece) const;
+    // The piece's unigram log-probability (tokenizer.ggml.scores); 0 when
+    // the GGUF carries none or `id` is out of range.
+    float               score(int id) const;
 
     // True if the token at `id` is a CONTROL-typed entry per the GGUF
     // tokenizer.ggml.token_type array (= TOKEN_TYPE_CONTROL = 3, the

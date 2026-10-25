@@ -28,6 +28,7 @@
 #include "transcribe-log.h"
 #include "transcribe-mel.h"
 #include "transcribe-meta.h"
+#include "transcribe-prompting.h"
 #include "transcribe/parakeet.h"
 #include "weights.h"
 
@@ -386,10 +387,28 @@ void reset_streaming_decoder_state(ParakeetSession * pc, const ParakeetModel * p
     pc->stream_dec_state.lstm_state.reset(n_layers, pred_hidden);
     pc->stream_dec_state.prev_token_id = -1;
     pc->stream_dec_state.frame_offset  = 0;
+    pc->stream_dec_state.boost_cursor  = PhraseBoost::kRoot;
     pc->stream_dec_state.initialized   = true;
 }
 
 namespace {
+
+// Builds the session's vocabulary boost from a run's / stream's terms (an
+// empty boost when there are none) and reads its blank penalty. The
+// dispatcher has already dropped the terms on models without
+// TRANSCRIBE_FEATURE_VOCABULARY.
+void prepare_phrase_boost(ParakeetSession * pc, const ParakeetModel * pm, const transcribe_run_params * params) {
+    pc->blank_penalty                    = rnnt_blank_penalty();
+    const std::vector<std::string> terms = transcribe::prompting::terms(params);
+    if (terms.empty()) {
+        pc->boost.clear();
+        return;
+    }
+    const float weight = phrase_boost_weight();
+    pc->boost.build(pm->tok, pm->host_decoder.predictor.pred_vocab, pm->host_decoder.blank_id, terms, weight);
+    log_msg(TRANSCRIBE_LOG_LEVEL_DEBUG, "parakeet: boosting %zu vocabulary term(s), weight %.2f", pc->boost.n_terms(),
+            static_cast<double>(pc->boost.weight()));
+}
 
 // Forward declarations for the Arch trait below.
 extern transcribe_status load(Loader &, const transcribe_model_load_params *, transcribe_model **);
@@ -586,6 +605,10 @@ transcribe_status load(Loader & loader, const transcribe_model_load_params * par
     if (const transcribe_status st = build_host_decoder_weights(*m, m->host_decoder); st != TRANSCRIBE_OK) {
         return st;
     }
+
+    // Vocabulary terms bias the greedy transducer decode (boost.h); the CTC
+    // head has no such path.
+    transcribe::set_feature(m.get(), TRANSCRIBE_FEATURE_VOCABULARY, m->host_decoder.head_kind != HostHeadKind::CTC);
 
     // Multitalker bundle post-load: fuse the diarizer conformer's BN (needs
     // uploaded data), build its ceil-framed mel frontend, and publish the
@@ -827,10 +850,11 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
         transcribe_status st = TRANSCRIBE_OK;
         switch (pm->host_decoder.head_kind) {
             case HostHeadKind::TDT:
-                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
+                st = decode_tdt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, &pc->boost);
                 break;
             case HostHeadKind::RNNT:
-                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
+                st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, &pc->boost,
+                                        pc->blank_penalty);
                 break;
             case HostHeadKind::CTC:
                 st = decode_ctc_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
@@ -1776,6 +1800,7 @@ transcribe_status run(transcribe_session *          session,
     }
 
     pc->clear_result();
+    prepare_phrase_boost(pc, pm, params);
 
     // Multitalker bundle: diarize=ON routes through the embedded-sortformer
     // orchestrator (per-speaker passes + merged speaker-tagged result).
@@ -2060,6 +2085,7 @@ transcribe_status run_batch(transcribe_session *          session,
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
     transcribe::debug::init();
+    prepare_phrase_boost(pc, pm, params);
 
     // Multitalker is a transcribe_run concern for now: batch keeps the
     // shipped single-speaker semantics even on a bundle model. Warn so a
@@ -2778,7 +2804,8 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, pc->enc_host.data(), T_q_new, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
-            pc->raw_tokens);
+            pc->raw_tokens, &pc->boost, pc->stream_dec_state.boost_cursor, pc->blank_penalty,
+            &pc->stream_dec_state.history);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -2792,12 +2819,11 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
 
 namespace {
 
-// Rebuild the public result vectors (tokens, full_text) from the
-// committed raw_tokens; idempotent. Words/segments are NOT populated
-// during streaming (deferred to finalize). result_kind is TOKEN whenever
+// Rebuild the public result (tokens, words, one segment, full_text) from
+// the committed raw_tokens; idempotent. result_kind is TOKEN whenever
 // tokens are present — each gets real t0/t1 from step_at_emit, the
 // strongest honest answer at this granularity.
-void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * pm) {
+void rebuild_streaming_result_text(ParakeetSession * pc, ParakeetModel * pm) {
     pc->tokens.clear();
     pc->words.clear();
     pc->segments.clear();
@@ -2809,52 +2835,38 @@ void rebuild_streaming_result_text(ParakeetSession * pc, const ParakeetModel * p
         return;
     }
 
-    const double frame_to_ms = parakeet_ms_per_enc_frame(pm->hparams);
+    // The offline builder, at TOKEN granularity whatever the stream asked
+    // for: tokens with t0/t1 as before, plus the words (split on
+    // SentencePiece boundaries; the last one may still gain pieces) and one
+    // segment, so a single-speaker stream's snapshot has words like a
+    // multitalker one.
+    transcribe_run_params params = pc->stream_run_params;
+    params.timestamps            = TRANSCRIBE_TIMESTAMPS_TOKEN;
+    (void) build_result_from_raw_tokens(pc, pm, &params);
 
-    // Strip CONTROL / UNKNOWN / <ll-RR> pieces from the public result, mirroring
-    // decode_and_populate (gated on keep_special_tags). Only the public
-    // projection is filtered; pc->raw_tokens stays whole.
-    const transcribe::Tokenizer & tok        = pm->tok;
-    const bool                    strip_tags = !pc->stream_run_params.keep_special_tags;
-
-    pc->tokens.reserve(pc->raw_tokens.size());
-    std::vector<int32_t> all_ids;
-    all_ids.reserve(pc->raw_tokens.size());
-    for (const auto & tk : pc->raw_tokens) {
-        if (strip_tags && is_strippable_special(tok, tk.id)) {
-            continue;
-        }
-        transcribe_session::TokenEntry te;
-        te.id    = tk.id;
-        te.p     = tk.p;
-        te.t0_ms = static_cast<int64_t>(std::llround(frame_to_ms * static_cast<double>(tk.step_at_emit)));
-        te.t1_ms =
-            static_cast<int64_t>(std::llround(frame_to_ms * static_cast<double>(tk.step_at_emit + tk.duration_frames)));
-        te.seg_index  = 0;
-        te.word_index = -1;
-        te.text       = tok.decode(&tk.id, 1);
-        pc->tokens.push_back(std::move(te));
-        all_ids.push_back(tk.id);
-    }
-    pc->full_text = tok.decode(all_ids.data(), static_cast<int>(all_ids.size()));
-    normalize_transcript_whitespace(pc->full_text);
-    {
-        std::vector<int32_t> raw_ids;
-        raw_ids.reserve(pc->raw_tokens.size());
-        for (const auto & tk : pc->raw_tokens) {
-            raw_ids.push_back(tk.id);
-        }
-        pc->raw_text = tok.decode(raw_ids.data(), static_cast<int>(raw_ids.size()));
-    }
     if (pc->buf_active) {
         const int64_t max_ms = us_to_ms(pc->stream_audio_input_us);
         for (auto & token : pc->tokens) {
             token.t1_ms = std::min(token.t1_ms, max_ms);
             token.t0_ms = std::min(token.t0_ms, token.t1_ms);
         }
+        for (auto & word : pc->words) {
+            word.t1_ms = std::min(word.t1_ms, max_ms);
+            word.t0_ms = std::min(word.t0_ms, word.t1_ms);
+        }
     }
-    pc->has_result  = true;
-    pc->result_kind = TRANSCRIBE_TIMESTAMPS_TOKEN;
+}
+
+// A finished single-speaker stream's decode, kept for stream_score as
+// speaker 1's until the next begin (a reset clears the session's words).
+void keep_for_scoring(ParakeetSession * pc) {
+    pc->scoring.clear();
+    ParakeetSession::ScoringSpeaker kept;
+    kept.speaker = 1;
+    kept.history = std::move(pc->stream_dec_state.history);
+    kept.raw     = pc->raw_tokens;
+    kept.words   = pc->words;
+    pc->scoring.push_back(std::move(kept));
 }
 
 // ----- Buffered streaming (parakeet-unified-en-0.6b) -----
@@ -3172,7 +3184,8 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, enc_chunk, T_to_decode, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
-            pc->raw_tokens);
+            pc->raw_tokens, &pc->boost, pc->stream_dec_state.boost_cursor, pc->blank_penalty,
+            &pc->stream_dec_state.history);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -3395,6 +3408,7 @@ transcribe_status stream_begin(transcribe_session *             session,
 
     pc->stream_audio_input_samples = 0;
     pc->mt_stream.reset();
+    prepare_phrase_boost(pc, pm, run_params);
 
     // -------- Buffered streaming path (parakeet-unified-en-0.6b) --------
     //
@@ -3434,6 +3448,8 @@ transcribe_status stream_begin(transcribe_session *             session,
         pc->raw_tokens.clear();
         pc->stream_run_params = *run_params;
         reset_streaming_decoder_state(pc, pm);
+        pc->stream_dec_state.history.clear();
+        pc->scoring.clear();
         // frame_offset starts at 0, advanced per-chunk by T_to_decode.
         pc->stream_dec_state.frame_offset = 0;
 
@@ -3455,6 +3471,8 @@ transcribe_status stream_begin(transcribe_session *             session,
     pc->raw_tokens.clear();  // parakeet-internal, accumulates per-chunk;
                              // clear_result doesn't touch it, so reset here
                              // or a back-to-back stream_begin carries tokens.
+    pc->stream_dec_state.history.clear();
+    pc->scoring.clear();
     pc->stream_run_params = *run_params;
 
     // Multitalker bundle: diarize=ON streams the embedded diarizer plus one
@@ -3779,6 +3797,7 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
         if (tokens_changed || !pc->has_result) {
             rebuild_streaming_result_text(pc, pm);
         }
+        keep_for_scoring(pc);
         pc->stream_audio_committed_us = pc->stream_audio_input_us;
         pc->n_committed_tokens        = static_cast<int>(pc->tokens.size());
         pc->n_committed_words         = static_cast<int>(pc->words.size());
@@ -3860,6 +3879,7 @@ transcribe_status stream_finalize(transcribe_session * session, transcribe_strea
     if (tokens_changed || !pc->has_result) {
         rebuild_streaming_result_text(pc, pm);
     }
+    keep_for_scoring(pc);
 
     // Commit everything: at finalize all emitted tokens are final.
     pc->stream_audio_committed_us = pc->stream_audio_input_us;
@@ -3907,6 +3927,86 @@ bool accepts_ext_kind(const transcribe_model * model, transcribe_ext_slot slot, 
     return false;
 }
 
+// Arch::stream_score (transcribe_stream_score_alternatives) for RNN-T
+// streams: the words' tokens, the decoder history, and forced alignment
+// of each candidate over the same frames.
+transcribe_status stream_score(transcribe_session * session,
+                               int                  speaker,
+                               int                  first_word,
+                               int                  n_words,
+                               const char * const * candidates,
+                               int                  n_candidates,
+                               float *              scores,
+                               float *              transcribed) {
+    auto *          pc    = static_cast<ParakeetSession *>(session);
+    auto *          pm    = static_cast<ParakeetModel *>(pc->model);
+    constexpr float kNone = -std::numeric_limits<float>::infinity();
+    *transcribed          = kNone;
+    std::fill_n(scores, n_candidates, kNone);
+    if (pm->host_decoder.head_kind != HostHeadKind::RNNT) {
+        return TRANSCRIBE_ERR_NOT_IMPLEMENTED;
+    }
+    const DecodeHistory *                              history = &pc->stream_dec_state.history;
+    const std::vector<TdtToken> *                      raw     = &pc->raw_tokens;
+    const std::vector<transcribe_session::WordEntry> * words   = &pc->words;
+    if ((pc->mt_stream != nullptr || !pc->scoring.empty()) &&
+        !multitalker_speaker_decode(pc, speaker, &history, &raw, &words)) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    if (first_word < 0 || n_words <= 0 ||
+        static_cast<size_t>(first_word) + static_cast<size_t>(n_words) > words->size()) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    // Result tokens are the raw ones without strippable specials.
+    const bool           strip = !pc->stream_run_params.keep_special_tags;
+    std::vector<int64_t> raw_of;
+    raw_of.reserve(raw->size());
+    for (size_t i = 0; i < raw->size(); ++i) {
+        if (!(strip && is_strippable_special(pm->tok, (*raw)[i].id))) {
+            raw_of.push_back(static_cast<int64_t>(i));
+        }
+    }
+    const auto & w0 = (*words)[static_cast<size_t>(first_word)];
+    const auto & wl = (*words)[static_cast<size_t>(first_word + n_words - 1)];
+    const int    r0 = w0.first_token;
+    const int    r1 = wl.first_token + wl.n_tokens;
+    if (r0 < 0 || r0 >= r1 || static_cast<size_t>(r1) > raw_of.size()) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    const int64_t first_raw = raw_of[static_cast<size_t>(r0)];
+    const int64_t end_raw =
+        static_cast<size_t>(r1) < raw_of.size() ? raw_of[static_cast<size_t>(r1)] : static_cast<int64_t>(raw->size());
+    const DecodeHistory::WordStart * start = history->start_at(first_raw);
+    if (start == nullptr) {
+        return TRANSCRIBE_OK;
+    }
+    // Through the frame the next word starts on (or the last one kept).
+    const int64_t        last_frame = end_raw < static_cast<int64_t>(raw->size()) ?
+                                          static_cast<int64_t>((*raw)[static_cast<size_t>(end_raw)].step_at_emit) :
+                                          history->end_frame() - 1;
+    std::vector<int32_t> said;
+    for (int64_t i = first_raw; i < end_raw; ++i) {
+        said.push_back((*raw)[static_cast<size_t>(i)].id);
+    }
+    *transcribed = score_tokens(pm->host_decoder, *history, *start, last_frame, said, pc->n_threads);
+    for (int c = 0; c < n_candidates; ++c) {
+        if (candidates[c] == nullptr) {
+            continue;
+        }
+        // The better of two spellings: the model's own (greedy, can paint
+        // itself into a corner) and the most likely by the vocabulary.
+        for (const std::vector<int32_t> & ids :
+             { model_pieces(pm->host_decoder, *history, *start, last_frame, candidates[c], pc->n_threads),
+               spell_pieces(pm->host_decoder, candidates[c]) }) {
+            if (!ids.empty()) {
+                scores[c] = std::max(scores[c],
+                                     score_tokens(pm->host_decoder, *history, *start, last_frame, ids, pc->n_threads));
+            }
+        }
+    }
+    return TRANSCRIBE_OK;
+}
+
 }  // namespace
 
 // `extern const` forces external linkage (a namespace-scope const object
@@ -3923,6 +4023,11 @@ extern const Arch arch = {
     /* .stream_finalize  = */ stream_finalize,
     /* .stream_reset     = */ stream_reset,
     /* .accepts_ext_kind = */ accepts_ext_kind,
+    /* .run_validate     = */ nullptr,
+    /* .diarize          = */ nullptr,
+    /* .langid           = */ nullptr,
+    /* .vad              = */ nullptr,
+    /* .stream_score     = */ stream_score,
 };
 
 }  // namespace transcribe::parakeet

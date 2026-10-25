@@ -81,6 +81,31 @@ impl Default for RunOptions {
     }
 }
 
+// transcribe/experimental.h: outside the generated, ABI-pinned surface.
+unsafe extern "C" {
+    fn transcribe_stream_score_alternatives(
+        session: *mut sys::transcribe_session,
+        speaker: std::os::raw::c_int,
+        first_word: std::os::raw::c_int,
+        n_words: std::os::raw::c_int,
+        candidates: *const *const std::os::raw::c_char,
+        n_candidates: std::os::raw::c_int,
+        scores: *mut f32,
+        transcribed: *mut f32,
+    ) -> sys::transcribe_status;
+}
+
+/// Scores of alternative spellings for a stretch of a speaker's words
+/// ([`Session::score_alternatives`]): log-probabilities in nats,
+/// `-inf` where the stream cannot give one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlternativeScores {
+    /// The words as transcribed.
+    pub transcribed: f32,
+    /// One per candidate, in order.
+    pub candidates: Vec<f32>,
+}
+
 /// A transcription session.
 pub struct Session {
     ptr: *mut sys::transcribe_session,
@@ -555,7 +580,63 @@ impl Drop for Stream<'_> {
     }
 }
 
+impl Session {
+    /// Experimental: how well the audio supports each of `candidates` in place
+    /// of `n_words` of speaker `speaker`'s words from `first_word` (speakers
+    /// as in the snapshot's segments, 1 without diarization; words numbered
+    /// per speaker in snapshot order), against the words as transcribed: the
+    /// model's log-probability of each over the same audio. Works on the
+    /// active stream and on a finished one until the next stream begins.
+    /// Parakeet RNN-T streams only.
+    pub fn score_alternatives(
+        &mut self,
+        speaker: i32,
+        first_word: i32,
+        n_words: i32,
+        candidates: &[&str],
+    ) -> Result<AlternativeScores> {
+        let owned = candidates
+            .iter()
+            .map(|c| CString::new(*c))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let ptrs: Vec<*const std::os::raw::c_char> = owned.iter().map(|c| c.as_ptr()).collect();
+        let n = std::os::raw::c_int::try_from(ptrs.len())
+            .map_err(|_| Error::InvalidArgument("too many candidates".into()))?;
+        let mut scores = vec![f32::NEG_INFINITY; ptrs.len()];
+        let mut transcribed = f32::NEG_INFINITY;
+        let ptr = self.ptr;
+        let status = self.model.with_compute(None, |_| unsafe {
+            transcribe_stream_score_alternatives(
+                ptr,
+                speaker,
+                first_word,
+                n_words,
+                ptrs.as_ptr(),
+                n,
+                scores.as_mut_ptr(),
+                &mut transcribed,
+            )
+        })?;
+        check(status, "stream score alternatives")?;
+        Ok(AlternativeScores {
+            transcribed,
+            candidates: scores,
+        })
+    }
+}
+
 impl Stream<'_> {
+    /// [`Session::score_alternatives`] on this stream.
+    pub fn score_alternatives(
+        &mut self,
+        speaker: i32,
+        first_word: i32,
+        n_words: i32,
+        candidates: &[&str],
+    ) -> Result<AlternativeScores> {
+        self.session.score_alternatives(speaker, first_word, n_words, candidates)
+    }
+
     /// Feed a chunk of 16 kHz mono float32 PCM and return the change metadata.
     pub fn feed(&mut self, pcm: &[f32]) -> Result<StreamUpdate> {
         let n = clamp_len(pcm.len())?;

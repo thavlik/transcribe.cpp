@@ -165,6 +165,10 @@ All Parakeet variants support:
 - **Transcription** of 16 kHz mono WAV input.
 - **Token-level timestamps** at the encoder frame rate (TDT and RNN-T;
   CTC also exposes frame-level alignment).
+- **Vocabulary boosting** (`--vocabulary`, `--vocabulary-file`) on TDT
+  and RNN-T heads, offline and streaming: the greedy decode is biased
+  toward the terms' spellings (see [prompting](../prompting.md)). CTC
+  heads ignore the vocabulary with a warning.
 
 **Buffered streaming** is supported on `parakeet-unified-en-0.6b`
 across all six published `(L, C, R)` configurations from the model's

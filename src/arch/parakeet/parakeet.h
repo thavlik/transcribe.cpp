@@ -8,6 +8,7 @@
 #pragma once
 
 #include "../sortformer/sortformer.h"  // embedded diarizer (multitalker bundle)
+#include "boost.h"
 #include "decoder.h"
 #include "transcribe-backend.h"
 #include "transcribe-load-common.h"
@@ -251,6 +252,14 @@ struct ParakeetStreamingDecoderState {
     // into stream-wide frame indices.
     int64_t frame_offset = 0;
 
+    // Vocabulary-boost match state (PhraseBoost cursor) after the last
+    // emitted token.
+    int32_t boost_cursor = PhraseBoost::kRoot;
+
+    // Recent frames and word starts, for scoring alternatives
+    // (parakeet_stream_score).
+    DecodeHistory history;
+
     bool initialized = false;
 };
 
@@ -328,6 +337,12 @@ struct ParakeetSession final : public transcribe_session {
     std::vector<float>    enc_host;
     std::vector<TdtToken> raw_tokens;
 
+    // Vocabulary boost for the current run or stream, rebuilt from its
+    // terms at every run / run_batch / stream_begin (boost.h), and the
+    // RNN-T blank penalty read with it (rnnt_blank_penalty).
+    PhraseBoost boost;
+    float       blank_penalty = 0.0f;
+
     // Multitalker bundle scratch: streaming-diarizer AOSC/FIFO state for
     // the embedded sortformer forward (diarize=ON runs only).
     transcribe::sortformer::DiarStreamScratch diar_scratch;
@@ -394,6 +409,19 @@ struct ParakeetSession final : public transcribe_session {
     // route to the multitalker driver and the result snapshot carries one
     // speaker-tagged segment per active speaker.
     std::unique_ptr<MultitalkerStream, MultitalkerStreamDeleter> mt_stream;
+
+    // A finished stream's per-speaker decodes (a single-speaker stream's as
+    // speaker 1), kept for stream_score until the next stream begins: the
+    // multitalker instances are freed at finalize, and a reset clears the
+    // session's words.
+    struct ScoringSpeaker {
+        int                                        speaker = 0;  // 1-based
+        DecodeHistory                              history;
+        std::vector<TdtToken>                      raw;
+        std::vector<transcribe_session::WordEntry> words;
+    };
+
+    std::vector<ScoringSpeaker> scoring;
 
     ParakeetSession() = default;
     ~ParakeetSession() override;
@@ -490,5 +518,14 @@ transcribe_status multitalker_stream_feed(ParakeetSession *          pc,
 transcribe_status multitalker_stream_finalize(ParakeetSession *          pc,
                                               ParakeetModel *            pm,
                                               transcribe_stream_update * update);
+
+// Speaker `speaker`'s (1-based) decode in the session's multitalker stream,
+// live or finished: its decoder history, emitted tokens and snapshot words.
+// False when the session has no such stream or speaker.
+bool multitalker_speaker_decode(const ParakeetSession *                             pc,
+                                int                                                 speaker,
+                                const DecodeHistory **                              history,
+                                const std::vector<TdtToken> **                      raw,
+                                const std::vector<transcribe_session::WordEntry> ** words);
 
 }  // namespace transcribe::parakeet

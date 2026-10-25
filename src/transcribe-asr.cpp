@@ -25,6 +25,7 @@
 #include "transcribe-session.h"
 #include "transcribe-tokenizer.h"
 #include "transcribe.h"
+#include "transcribe/experimental.h"
 
 #include <algorithm>
 #include <climits>
@@ -2379,6 +2380,39 @@ extern "C" transcribe_status transcribe_stream_finalize(struct transcribe_sessio
 
 extern "C" void transcribe_stream_reset(struct transcribe_session * session) {
     api_guard_void("transcribe_stream_reset", [&] { transcribe_stream_reset_impl(session); });
+}
+
+static transcribe_status transcribe_stream_score_alternatives_impl(struct transcribe_session * session,
+                                                                   int                         speaker,
+                                                                   int                         first_word,
+                                                                   int                         n_words,
+                                                                   const char * const *        candidates,
+                                                                   int                         n_candidates,
+                                                                   float *                     scores,
+                                                                   float *                     transcribed) {
+    if (session == nullptr || session->model == nullptr || transcribed == nullptr || n_candidates < 0 ||
+        (n_candidates > 0 && (candidates == nullptr || scores == nullptr))) {
+        return TRANSCRIBE_ERR_INVALID_ARG;
+    }
+    const auto * arch = session->model->arch;
+    if (arch == nullptr || arch->stream_score == nullptr) {
+        return TRANSCRIBE_ERR_NOT_IMPLEMENTED;
+    }
+    return arch->stream_score(session, speaker, first_word, n_words, candidates, n_candidates, scores, transcribed);
+}
+
+extern "C" transcribe_status transcribe_stream_score_alternatives(struct transcribe_session * session,
+                                                                  int                         speaker,
+                                                                  int                         first_word,
+                                                                  int                         n_words,
+                                                                  const char * const *        candidates,
+                                                                  int                         n_candidates,
+                                                                  float *                     scores,
+                                                                  float *                     transcribed) {
+    return api_guard_status("transcribe_stream_score_alternatives", [&] {
+        return transcribe_stream_score_alternatives_impl(session, speaker, first_word, n_words, candidates,
+                                                         n_candidates, scores, transcribed);
+    });
 }
 
 extern "C" int transcribe_tokenize(const struct transcribe_model * model,

@@ -92,6 +92,13 @@ const std::string & Tokenizer::token(int id) const {
     return tokens_[static_cast<size_t>(id)];
 }
 
+float Tokenizer::score(int id) const {
+    if (id < 0 || static_cast<size_t>(id) >= scores_.size()) {
+        return 0.0f;
+    }
+    return scores_[static_cast<size_t>(id)];
+}
+
 bool Tokenizer::has_token_type(int id, int32_t type) const {
     if (id < 0 || static_cast<size_t>(id) >= token_type_.size()) {
         return false;

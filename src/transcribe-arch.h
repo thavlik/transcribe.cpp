@@ -137,6 +137,17 @@ struct Arch {
     const DiarizeOps * diarize;
     const LangidOps *  langid;
     const VadOps *     vad;
+
+    // Optional: score alternatives to a stretch of a stream's words
+    // (transcribe_stream_score_alternatives, transcribe/experimental.h).
+    transcribe_status (*stream_score)(struct transcribe_session * ctx,
+                                      int                         speaker,
+                                      int                         first_word,
+                                      int                         n_words,
+                                      const char * const *        candidates,
+                                      int                         n_candidates,
+                                      float *                     scores,
+                                      float *                     transcribed);
 };
 
 // Look up an architecture by name. Returns nullptr if no registered

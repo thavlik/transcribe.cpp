@@ -32,13 +32,16 @@
 #include "transcribe.h"
 
 #include <cstdint>
+#include <deque>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace transcribe::parakeet {
 
 struct ParakeetModel;
 struct ParakeetHParams;
+class PhraseBoost;
 
 // ---------------------------------------------------------------------------
 // Host weight mirrors
@@ -161,16 +164,22 @@ enum class HostHeadKind { TDT, RNNT, CTC };
 // empty; for RNNT tdt_durations is empty and only the tdt_max_symbols
 // cap is reused.
 struct HostDecoderWeights {
-    HostHeadKind         head_kind = HostHeadKind::TDT;
-    HostPredictor        predictor;      // empty for CTC
-    HostJoint            joint;          // empty for CTC
-    HostCtcHead          ctc_head;       // empty for TDT/RNNT
-    std::vector<int32_t> tdt_durations;  // empty for RNNT/CTC
-    int                  tdt_max_symbols          = 0;
+    HostHeadKind             head_kind = HostHeadKind::TDT;
+    HostPredictor            predictor;      // empty for CTC
+    HostJoint                joint;          // empty for CTC
+    HostCtcHead              ctc_head;       // empty for TDT/RNNT
+    std::vector<int32_t>     tdt_durations;  // empty for RNNT/CTC
+    int                      tdt_max_symbols          = 0;
     // See ParakeetHParams::tdt_global_symbol_budget.
-    bool                 tdt_global_symbol_budget = false;
-    int                  blank_id                 = 0;  // unified: TDT/RNNT == pred_vocab - 1; CTC == ctc_head.blank_id
-    int                  n_vocab                  = 0;  // raw SP vocab size (excludes blank)
+    bool                     tdt_global_symbol_budget = false;
+    int                      blank_id = 0;  // unified: TDT/RNNT == pred_vocab - 1; CTC == ctc_head.blank_id
+    int                      n_vocab  = 0;  // raw SP vocab size (excludes blank)
+    // Per piece: its text, unigram score, and whether it starts a word
+    // ("▁"); by text, its id. For DecodeHistory and spell_pieces.
+    std::vector<std::string> pieces;
+    std::vector<float>       piece_scores;
+    std::vector<uint8_t>     word_start;
+    std::unordered_map<std::string, int32_t> piece_ids;
 };
 
 // Build host mirrors from a loaded ParakeetModel. Reads tensor bytes
@@ -189,6 +198,35 @@ struct LstmState {
     std::vector<std::vector<float>> c;
 
     void reset(int n_layers, int pred_hidden);
+};
+
+// A stream decoder's recent inputs, kept so alternatives to what it emitted
+// can be scored (score_tokens): the joint's encoder projection of every
+// frame and the predictor's input at every word-start token, over the last
+// kFrames frames. Frames and tokens are in the decoder's own coordinates
+// (step_at_emit, the index in its emitted tokens).
+struct DecodeHistory {
+    static constexpr int64_t kFrames = 4500;  // 6 minutes of 80 ms frames
+
+    struct WordStart {
+        int64_t   token      = 0;
+        int64_t   frame      = 0;   // the frame it was emitted at
+        int32_t   prev_token = -1;  // predictor input before it
+        LstmState state;            // predictor state before it
+    };
+
+    int64_t               first_frame = 0;  // frame of enc_proj's first row
+    int                   joint_h     = 0;
+    std::vector<float>    enc_proj;         // joint_h floats per frame
+    std::deque<WordStart> starts;
+
+    void clear();
+
+    int64_t end_frame() const {
+        return joint_h > 0 ? first_frame + static_cast<int64_t>(enc_proj.size()) / joint_h : first_frame;
+    }
+
+    const WordStart * start_at(int64_t token) const;
 };
 
 // One emitted (non-blank) TDT token. `step_at_emit` is the encoder
@@ -216,6 +254,9 @@ struct TdtToken {
 // Outputs:
 //   out_tokens - appended with one TdtToken per non-blank emission
 //
+//   boost    - optional vocabulary boost (boost.h); nullptr or empty
+//              decodes with the plain argmax
+//
 // Returns TRANSCRIBE_OK on success; cannot fail except via invalid args
 // (validated by the family driver before this is called).
 transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
@@ -223,19 +264,24 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
                                     int                        T_enc,
                                     int                        d_enc,
                                     int                        n_threads,
-                                    std::vector<TdtToken> &    out_tokens);
+                                    std::vector<TdtToken> &    out_tokens,
+                                    const PhraseBoost *        boost = nullptr);
 
 // Run RNNT greedy decode end-to-end. Same predictor + joint code as TDT,
 // but the joint emits `vocab+1` logits (no duration extras) and the step
 // rule is "blank → advance one frame, non-blank → emit + stay, capped by
 // tdt_max_symbols". Per-emit duration_frames is fixed at 1. Same I/O
-// contract and TdtToken result type as decode_tdt_greedy.
+// contract and TdtToken result type as decode_tdt_greedy. `blank_penalty`
+// (nats, see rnnt_blank_penalty) is taken off the blank logit before each
+// greedy choice; token confidences stay on the raw logits.
 transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      const float *              enc_out,
                                      int                        T_enc,
                                      int                        d_enc,
                                      int                        n_threads,
-                                     std::vector<TdtToken> &    out_tokens);
+                                     std::vector<TdtToken> &    out_tokens,
+                                     const PhraseBoost *        boost         = nullptr,
+                                     float                      blank_penalty = 0.0f);
 
 // Streaming variant of RNN-T greedy decode. Consumes T_enc_new encoder
 // frames (the chunk just produced) and APPENDS emitted tokens to
@@ -243,7 +289,10 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
 // state_io / last_token_io; frame_offset is the absolute encoder-frame
 // index of this chunk's first frame (so step_at_emit lands in
 // stream-wide coordinates). state_io must have been reset to a fresh
-// start-of-sequence state at stream_begin (last_token_io = -1).
+// start-of-sequence state at stream_begin (last_token_io = -1). With a
+// non-empty `boost`, boost_cursor_io carries its match state across calls
+// (PhraseBoost::kRoot at stream_begin). blank_penalty as in
+// decode_rnnt_greedy.
 transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                const float *              enc_out,
                                                int                        T_enc_new,
@@ -252,7 +301,45 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                int &                      last_token_io,
                                                int                        frame_offset,
                                                int                        n_threads,
-                                               std::vector<TdtToken> &    out_tokens);
+                                               std::vector<TdtToken> &    out_tokens,
+                                               const PhraseBoost *        boost,
+                                               int32_t &                  boost_cursor_io,
+                                               float                      blank_penalty = 0.0f,
+                                               DecodeHistory *            history       = nullptr);
+
+// The model's log-probability (nats) of emitting `tokens` from the word
+// start `start` (an entry of `history`) through frame `last_frame`, summed
+// over every RNN-T alignment: the tokens are emitted at frames up to
+// last_frame, blanks consume the frames before it. Raw logits (no blank
+// penalty, no boost). -INFINITY when the frames are no longer kept or the
+// span is too long to score.
+float score_tokens(const HostDecoderWeights &       w,
+                   const DecodeHistory &            history,
+                   const DecodeHistory::WordStart & start,
+                   int64_t                          last_frame,
+                   const std::vector<int32_t> &     tokens,
+                   int                              n_threads);
+
+// `text` as the model's SentencePiece pieces (words begin with "▁"), the
+// segmentation with the highest unigram score; empty when the vocabulary
+// cannot spell it.
+std::vector<int32_t> spell_pieces(const HostDecoderWeights & w, const std::string & text);
+
+// `text` as the pieces the model itself would spell it with from `start`
+// through `last_frame`: the greedy decode restricted to pieces that
+// continue the text. Empty when the vocabulary cannot spell it.
+std::vector<int32_t> model_pieces(const HostDecoderWeights &       w,
+                                  const DecodeHistory &            history,
+                                  const DecodeHistory::WordStart & start,
+                                  int64_t                          last_frame,
+                                  const std::string &              text,
+                                  int                              n_threads);
+
+// RNN-T blank penalty for this process: TRANSCRIBE_PARAKEET_BLANK_PENALTY
+// (nats) when set, 0 (the plain argmax) otherwise. Without one, a stream at
+// short lookahead can stay on blank through seconds of speech after a
+// sentence end.
+float rnnt_blank_penalty();
 
 // Run CTC greedy decode end-to-end. Per-frame: logits = W @ enc[t] + b,
 // argmax; collapse rule "drop adjacent duplicates, then drop blanks"
