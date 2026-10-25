@@ -10,6 +10,7 @@
 #include "../sortformer/sortformer.h"  // embedded diarizer (multitalker bundle)
 #include "boost.h"
 #include "decoder.h"
+#include "lm.h"
 #include "transcribe-backend.h"
 #include "transcribe-load-common.h"
 #include "transcribe-mel.h"
@@ -256,6 +257,9 @@ struct ParakeetStreamingDecoderState {
     // emitted token.
     int32_t boost_cursor = PhraseBoost::kRoot;
 
+    // Language-model context: the pieces emitted so far (lm.h).
+    LmContext lm_ctx;
+
     // Recent frames and word starts, for scoring alternatives
     // (parakeet_stream_score).
     DecodeHistory history;
@@ -339,9 +343,12 @@ struct ParakeetSession final : public transcribe_session {
 
     // Vocabulary boost for the current run or stream, rebuilt from its
     // terms at every run / run_batch / stream_begin (boost.h), and the
-    // RNN-T blank penalty read with it (rnnt_blank_penalty).
-    PhraseBoost boost;
-    float       blank_penalty = 0.0f;
+    // RNN-T blank penalty and language model read with it
+    // (rnnt_blank_penalty, process_lm).
+    PhraseBoost     boost;
+    float           blank_penalty = 0.0f;
+    const NgramLm * lm            = nullptr;
+    float           lm_weight     = 0.0f;
 
     // Multitalker bundle scratch: streaming-diarizer AOSC/FIFO state for
     // the embedded sortformer forward (diarize=ON runs only).

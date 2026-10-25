@@ -357,6 +357,14 @@ reproduces `transcribe_run` on the whole clip word for word.
   over the same frames, spelled both the way the model's own greedy decode
   would spell it and by the vocabulary's unigram scores. It works on the
   active stream and on a finished one until the next stream begins.
+- **Language-model fusion.** With `TRANSCRIBE_PARAKEET_LM` naming an ARPA
+  n-gram over the model's pieces, each speaker's greedy decode chooses the
+  piece it emits with weight x ln P(piece | its own pieces so far) added
+  (`TRANSCRIBE_PARAKEET_LM_WEIGHT`, 0.2), carrying its context across chunks
+  like its predictor state. Whether to emit (against blank) stays the
+  transducer's call: a language model that dislikes the next words would
+  otherwise hold the decoder on blank through them ("milligrams orally
+  provided no contraindications" came out as "mg").
 - **Text.** Rows are rewritten as speakers grow and the merged `full_text`
   is in segment order, so nothing commits before finalize: `committed_text`
   stays empty during the stream and `tentative_text` holds the merged text.

@@ -14,6 +14,7 @@
 #include "decoder.h"
 
 #include "boost.h"
+#include "lm.h"
 #include "parakeet.h"
 #include "transcribe-batch-util.h"
 #include "transcribe-debug.h"
@@ -1004,17 +1005,27 @@ int argmax_range(const float * data, int n) {
 }
 
 // An RNN-T step's greedy choice with `blank_penalty` taken off the blank
-// logit; `logits` is left raw (token confidences read it).
+// logit; when that is a piece and `lm` is active, the piece is chosen again
+// with the language model fused (lm.h), so the transducer alone decides
+// whether to emit. `logits` is left raw (token confidences read it).
 int pick_rnnt(const PhraseBoost *  boost,
               int32_t              cursor,
               std::vector<float> & logits,
               int                  n_cls,
               int                  blank_id,
-              float                blank_penalty) {
+              float                blank_penalty,
+              const LmFusion *     lm) {
     const float raw                       = logits[static_cast<size_t>(blank_id)];
     logits[static_cast<size_t>(blank_id)] = raw - blank_penalty;
-    const int token = boost != nullptr ? boost->pick(cursor, logits.data()) : argmax_range(logits.data(), n_cls);
+    int token = boost != nullptr ? boost->pick(cursor, logits.data()) : argmax_range(logits.data(), n_cls);
     logits[static_cast<size_t>(blank_id)] = raw;
+    if (token != blank_id && lm != nullptr && lm->active()) {
+        thread_local std::vector<float> fused;
+        fused.assign(logits.begin(), logits.end());
+        fused[static_cast<size_t>(blank_id)] = -std::numeric_limits<float>::infinity();
+        apply_lm(*lm, fused.data(), n_cls, blank_id);
+        token = boost != nullptr ? boost->pick(cursor, fused.data()) : argmax_range(fused.data(), n_cls);
+    }
     return token;
 }
 
@@ -1317,7 +1328,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        n_threads,
                                      std::vector<TdtToken> &    out_tokens,
                                      const PhraseBoost *        boost,
-                                     float                      blank_penalty) {
+                                     float                      blank_penalty,
+                                     const NgramLm *            lm,
+                                     float                      lm_weight) {
     if (enc_out == nullptr || T_enc <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1338,6 +1351,8 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
     // Vocabulary boost (see decode_tdt_greedy).
     const bool boost_on     = boost != nullptr && !boost->empty() && boost->n_classes() == n_token_cls;
     int32_t    boost_cursor = PhraseBoost::kRoot;
+    LmContext  lm_ctx;
+    LmFusion   fusion{ lm, lm_weight, &lm_ctx };
 
     // Per-call decode graphs (see decode_tdt_greedy for the lifecycle).
     PredGraph  pg;
@@ -1410,7 +1425,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
         // RNNT joint output is just `n_token_cls` floats (no duration extras).
         const float * token_logits = logits.data();
         const int     pred_token =
-            pick_rnnt(boost_on ? boost : nullptr, boost_cursor, logits, n_token_cls, blank_id, blank_penalty);
+            pick_rnnt(boost_on ? boost : nullptr, boost_cursor, logits, n_token_cls, blank_id, blank_penalty, &fusion);
 
         if (iter == 1 && transcribe::debug::enabled()) {
             const long long s_h = H;
@@ -1448,6 +1463,7 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
             if (boost_on) {
                 boost_cursor = boost->advance(boost_cursor, pred_token);
             }
+            lm_ctx.push(pred_token);
 
             new_symbols += 1;
             if (w.tdt_max_symbols > 0 && new_symbols >= w.tdt_max_symbols) {
@@ -1494,7 +1510,8 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                const PhraseBoost *        boost,
                                                int32_t &                  boost_cursor_io,
                                                float                      blank_penalty,
-                                               DecodeHistory *            history) {
+                                               DecodeHistory *            history,
+                                               const LmFusion *           lm) {
     if (enc_out == nullptr || T_enc_new <= 0 || d_enc <= 0) {
         return TRANSCRIBE_ERR_INVALID_ARG;
     }
@@ -1540,12 +1557,18 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
         state_io.reset(n_layers, H);
         last_token_io   = -1;
         boost_cursor_io = PhraseBoost::kRoot;
+        if (lm != nullptr && lm->ctx != nullptr) {
+            lm->ctx->n = 0;
+        }
     }
     for (int l = 0; l < n_layers; ++l) {
         if (static_cast<int>(state_io.h[l].size()) != H || static_cast<int>(state_io.c[l].size()) != H) {
             state_io.reset(n_layers, H);
             last_token_io   = -1;
             boost_cursor_io = PhraseBoost::kRoot;
+            if (lm != nullptr && lm->ctx != nullptr) {
+                lm->ctx->n = 0;
+            }
             break;
         }
     }
@@ -1618,7 +1641,7 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
 
         const float * token_logits = logits.data();
         const int     pred_token =
-            pick_rnnt(boost_on ? boost : nullptr, boost_cursor, logits, n_token_cls, blank_id, blank_penalty);
+            pick_rnnt(boost_on ? boost : nullptr, boost_cursor, logits, n_token_cls, blank_id, blank_penalty, lm);
 
         const bool is_blank = (pred_token == blank_id);
         if (is_blank) {
@@ -1647,6 +1670,9 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
             predictor_dirty = true;
             if (boost_on) {
                 boost_cursor = boost->advance(boost_cursor, pred_token);
+            }
+            if (lm != nullptr && lm->ctx != nullptr) {
+                lm->ctx->push(pred_token);
             }
 
             new_symbols += 1;

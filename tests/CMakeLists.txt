@@ -225,6 +225,13 @@ target_include_directories(transcribe_parakeet_boost_unit PRIVATE ${CMAKE_SOURCE
 transcribe_apply_warnings(transcribe_parakeet_boost_unit)
 add_test(NAME transcribe_parakeet_boost_unit COMMAND transcribe_parakeet_boost_unit)
 
+# Language-model fusion: ARPA loading, backoff and the fused pick's window.
+add_executable(transcribe_parakeet_lm_unit parakeet_lm_unit.cpp)
+target_link_libraries(transcribe_parakeet_lm_unit PRIVATE transcribe ggml)
+target_include_directories(transcribe_parakeet_lm_unit PRIVATE ${CMAKE_SOURCE_DIR}/src)
+transcribe_apply_warnings(transcribe_parakeet_lm_unit)
+add_test(NAME transcribe_parakeet_lm_unit COMMAND transcribe_parakeet_lm_unit)
+
 # -----------------------------------------------------------------------------
 # Variable-length batch mask and causal subsampling unit test
 # -----------------------------------------------------------------------------

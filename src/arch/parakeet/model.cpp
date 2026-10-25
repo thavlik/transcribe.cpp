@@ -388,17 +388,20 @@ void reset_streaming_decoder_state(ParakeetSession * pc, const ParakeetModel * p
     pc->stream_dec_state.prev_token_id = -1;
     pc->stream_dec_state.frame_offset  = 0;
     pc->stream_dec_state.boost_cursor  = PhraseBoost::kRoot;
+    pc->stream_dec_state.lm_ctx        = LmContext{};
     pc->stream_dec_state.initialized   = true;
 }
 
 namespace {
 
 // Builds the session's vocabulary boost from a run's / stream's terms (an
-// empty boost when there are none) and reads its blank penalty. The
-// dispatcher has already dropped the terms on models without
-// TRANSCRIBE_FEATURE_VOCABULARY.
+// empty boost when there are none) and reads its blank penalty and
+// language model. The dispatcher has already dropped the terms on models
+// without TRANSCRIBE_FEATURE_VOCABULARY.
 void prepare_phrase_boost(ParakeetSession * pc, const ParakeetModel * pm, const transcribe_run_params * params) {
     pc->blank_penalty                    = rnnt_blank_penalty();
+    pc->lm                               = process_lm();
+    pc->lm_weight                        = lm_weight();
     const std::vector<std::string> terms = transcribe::prompting::terms(params);
     if (terms.empty()) {
         pc->boost.clear();
@@ -854,7 +857,7 @@ static transcribe_status decode_and_populate(ParakeetSession *             pc,
                 break;
             case HostHeadKind::RNNT:
                 st = decode_rnnt_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens, &pc->boost,
-                                        pc->blank_penalty);
+                                        pc->blank_penalty, pc->lm, pc->lm_weight);
                 break;
             case HostHeadKind::CTC:
                 st = decode_ctc_greedy(pm->host_decoder, enc, T_enc, d_enc, pc->n_threads, pc->raw_tokens);
@@ -2801,11 +2804,12 @@ transcribe_status emit_streaming_chunk(ParakeetSession * pc,
     pc->stream_caches.chunk_step += 1;
 
     // Run streaming RNN-T decoder on the new encoder frames.
+    LmFusion fusion{ pc->lm, pc->lm_weight, &pc->stream_dec_state.lm_ctx };
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, pc->enc_host.data(), T_q_new, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
             pc->raw_tokens, &pc->boost, pc->stream_dec_state.boost_cursor, pc->blank_penalty,
-            &pc->stream_dec_state.history);
+            &pc->stream_dec_state.history, &fusion);
         st != TRANSCRIBE_OK) {
         return st;
     }
@@ -3181,11 +3185,12 @@ transcribe_status emit_buffered_chunk(ParakeetSession * pc,
 
     // ----- Decode with carried RNN-T state -----
     const int64_t t_dec_start = ggml_time_us();
+    LmFusion      fusion{ pc->lm, pc->lm_weight, &pc->stream_dec_state.lm_ctx };
     if (const transcribe_status st = decode_rnnt_greedy_streaming(
             pm->host_decoder, enc_chunk, T_to_decode, d_enc, pc->stream_dec_state.lstm_state,
             pc->stream_dec_state.prev_token_id, static_cast<int>(pc->stream_dec_state.frame_offset), pc->n_threads,
             pc->raw_tokens, &pc->boost, pc->stream_dec_state.boost_cursor, pc->blank_penalty,
-            &pc->stream_dec_state.history);
+            &pc->stream_dec_state.history, &fusion);
         st != TRANSCRIBE_OK) {
         return st;
     }

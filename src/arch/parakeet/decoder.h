@@ -42,6 +42,8 @@ namespace transcribe::parakeet {
 struct ParakeetModel;
 struct ParakeetHParams;
 class PhraseBoost;
+class NgramLm;
+struct LmFusion;
 
 // ---------------------------------------------------------------------------
 // Host weight mirrors
@@ -273,7 +275,8 @@ transcribe_status decode_tdt_greedy(const HostDecoderWeights & w,
 // tdt_max_symbols". Per-emit duration_frames is fixed at 1. Same I/O
 // contract and TdtToken result type as decode_tdt_greedy. `blank_penalty`
 // (nats, see rnnt_blank_penalty) is taken off the blank logit before each
-// greedy choice; token confidences stay on the raw logits.
+// greedy choice, and a non-null `lm` is fused with `lm_weight` (lm.h);
+// token confidences stay on the raw logits.
 transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      const float *              enc_out,
                                      int                        T_enc,
@@ -281,7 +284,9 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
                                      int                        n_threads,
                                      std::vector<TdtToken> &    out_tokens,
                                      const PhraseBoost *        boost         = nullptr,
-                                     float                      blank_penalty = 0.0f);
+                                     float                      blank_penalty = 0.0f,
+                                     const NgramLm *            lm            = nullptr,
+                                     float                      lm_weight     = 0.0f);
 
 // Streaming variant of RNN-T greedy decode. Consumes T_enc_new encoder
 // frames (the chunk just produced) and APPENDS emitted tokens to
@@ -292,7 +297,8 @@ transcribe_status decode_rnnt_greedy(const HostDecoderWeights & w,
 // start-of-sequence state at stream_begin (last_token_io = -1). With a
 // non-empty `boost`, boost_cursor_io carries its match state across calls
 // (PhraseBoost::kRoot at stream_begin). blank_penalty as in
-// decode_rnnt_greedy.
+// decode_rnnt_greedy; an active `lm` is fused, its context carried across
+// calls in lm->ctx (empty at stream_begin).
 transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                const float *              enc_out,
                                                int                        T_enc_new,
@@ -305,7 +311,8 @@ transcribe_status decode_rnnt_greedy_streaming(const HostDecoderWeights & w,
                                                const PhraseBoost *        boost,
                                                int32_t &                  boost_cursor_io,
                                                float                      blank_penalty = 0.0f,
-                                               DecodeHistory *            history       = nullptr);
+                                               DecodeHistory *            history       = nullptr,
+                                               const LmFusion *           lm            = nullptr);
 
 // The model's log-probability (nats) of emitting `tokens` from the word
 // start `start` (an entry of `history`) through frame `last_frame`, summed
